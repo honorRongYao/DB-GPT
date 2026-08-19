@@ -1,0 +1,37 @@
+[system]
+# Load language from environment variable(It is set by the hook)
+language = "${env:DBGPT_LANG:-zh}"
+api_keys = []
+encrypt_key = "your_secret_key"
+
+# Server Configurations
+[service.web]
+host = "0.0.0.0"
+port = 5670
+
+[service.web.database]
+type = "mysql"
+host = "10.233.3.32"
+port = 3306
+user = "root"
+database = "dbgpt"
+password = "JHSssk526."
+
+[rag.storage]
+[rag.storage.vector]
+type = "chroma"
+persist_path = "pilot/data"
+
+# Model Configurations
+[models]
+[[models.llms]]
+name = "deepseek-v4-flash"
+api_base = "https://zhenze-huhehaote.cmecloud.cn/tokenplan/v1"
+provider = "proxy/deepseek"
+api_key = "7kYS8-mli4vISGEBjxI3KSWF8AUEijEpy1jh6FKuEu4"
+
+[[models.embeddings]]
+name = "bge-m3"
+provider = "proxy/openai"
+api_url = "http://10.233.2.206:19094/v1/embeddings"
+api_key = "sk-asxfiof1134xccacz1412dcvg512"
