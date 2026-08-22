@@ -111,7 +111,7 @@ _PARAMETER_MODEL = Parameter.build_from(
     optional=True,
     default=None,
     description=_(
-        "选表模型名称（可选）：指定用于"LLM 选表"环节的模型名称。"
+        "选表模型名称（可选）：指定用于“LLM 选表”环节的模型名称。"
         "留空时自动使用 DB-GPT 默认部署模型的第一个模型。"
         "一般无需填写，保持默认即可；仅在需要与生成 SQL 的模型区分开时才填写。"
     ),
@@ -152,8 +152,8 @@ _PARAMETER_CONTEXT_KEY = Parameter.build_from(
     alias=["context"],
     description=_(
         "上下文键（可选，默认 context，一般不要改）："
-        "本算子输出的表结构文本在"键值对"里的键名，"
-        "下游"大语言模型算子"渲染提示词时，提示词里的 {context} 占位符会按这个键名"
+        "本算子输出的表结构文本在“键值对”里的键名，"
+        "下游“大语言模型算子”渲染提示词时，提示词里的 {context} 占位符会按这个键名"
         "找到表结构并填入。只有当你把下游 LLM 提示词中的表结构占位符改名"
         "（例如改成 {table_info}）时，这里才需要改成同名，否则两边对不上，"
         "表结构不会进入提示词。"
@@ -165,9 +165,9 @@ _INPUTS_QUESTION = IOField.build_from(
     "query",
     str,
     description=_(
-        "用户问题输入：用户在对话页输入的自然语言查询，例如"每个用户的订单金额排行"。"
+        "用户问题输入：用户在对话页输入的自然语言查询，例如“每个用户的订单金额排行”。"
         "语义层会用它（结合全量表目录）判断要查询哪些表，并加载这些表的完整字段。"
-        "在画布上由"通用大语言模型 HTTP 触发器"的"Request String Messages"输出口接入。"
+        "在画布上由“通用大语言模型 HTTP 触发器”的“Request String Messages”输出口接入。"
     ),
 )
 
@@ -178,7 +178,7 @@ _OUTPUTS_CONTEXT = IOField.build_from(
     description=_(
         "检索结果输出：包含数据库名/方言、LLM 根据用户问题选中的表及表间关联关系、"
         "以及选中表的完整表结构（字段/类型/主键/注释，不截断）的上下文对象。"
-        "在画布上接到"大语言模型算子"的"extra_context"输入口，"
+        "在画布上接到“大语言模型算子”的“extra_context”输入口，"
         "作为 LLM 生成 SQL 时的表结构参考。"
     ),
 )
@@ -207,7 +207,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             "语义层算子：先列出数据库全部表目录（表名+注释，注释可维护业务语义与表间关联关系），"
             "再让 LLM 根据用户问题判断要查询哪些表以及表与表之间的关联关系，"
             "最后对选中的表加载完整字段（不截断，含类型/主键/注释）。"
-            "输出与官方"数据源检索算子"类型一致（HOContextBody），可在画布上直接替换接线。"
+            "输出与官方“数据源检索算子”类型一致（HOContextBody），可在画布上直接替换接线。"
         ),
         category=OperatorCategory.DATABASE,
         parameters=[
