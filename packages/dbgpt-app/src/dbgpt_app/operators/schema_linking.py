@@ -176,7 +176,7 @@ _OUTPUTS_CONTEXT = IOField.build_from(
     "context",
     HOContextBody,
     description=_(
-        "检索结果输出：包含数据库名、全量表目录、LLM 选中的表及表间关联关系、"
+        "检索结果输出：包含数据库名/方言、LLM 根据用户问题选中的表及表间关联关系、"
         "以及选中表的完整表结构（字段/类型/主键/注释，不截断）的上下文对象。"
         "在画布上接到"大语言模型算子"的"extra_context"输入口，"
         "作为 LLM 生成 SQL 时的表结构参考。"
@@ -265,10 +265,14 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         for table_name in table_names:
             comment = ""
             try:
-                comment_dict = await self.blocking_func_to_async(
+                # 不同方言 get_table_comment 返回类型不一致，兼容 dict 和 str 两种
+                comment_raw = await self.blocking_func_to_async(
                     connector.get_table_comment, table_name
                 )
-                comment = (comment_dict or {}).get("text") or ""
+                if isinstance(comment_raw, dict):
+                    comment = (comment_raw or {}).get("text") or ""
+                else:
+                    comment = str(comment_raw or "")
             except Exception as e:
                 logger.warning(f"Get comment of table {table_name} failed: {e}")
             comment = str(comment).strip()
@@ -281,23 +285,25 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         catalog_str = "\n".join(
             f"{i + 1}. {item}" for i, item in enumerate(catalog)
         )
-        prompt = self._prompt_template.format(
-            db_name=self._datasource._db_name,
-            table_catalog=catalog_str,
-            user_input=question,
-            max_selected_tables=self._max_selected_tables,
-        )
-        messages = [
-            ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt)
-        ]
-        model_request = await self._build_model_request(messages)
         try:
+            prompt = self._prompt_template.format(
+                db_name=self._datasource._db_name,
+                table_catalog=catalog_str,
+                user_input=question,
+                max_selected_tables=self._max_selected_tables,
+            )
+            messages = [
+                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt)
+            ]
+            model_request = await self._build_model_request(messages)
             model_output: ModelOutput = await self.llm_client.generate(model_request)
             return self._parse_table_selection(model_output.text)
         except Exception as e:
             logger.warning(f"LLM select tables failed, fallback to all tables: {e}")
-            # 兜底：返回全部表，保证不中断流程
-            return [{"table": t, "relation": ""} for t in catalog]
+            # 兜底：返回全部表（只取纯表名，不带注释串），保证不中断流程
+            return [
+                {"table": t.split(" -- ", 1)[0], "relation": ""} for t in catalog
+            ]
 
     async def _build_model_request(self, messages: List[ModelMessage]) -> ModelRequest:
         models = await self.llm_client.models()
