@@ -17,8 +17,10 @@
 
 import json
 import logging
+import re
 from typing import List, Optional
 
+from dbgpt.agent import AgentGenerateContext
 from dbgpt.agent.resource.database import DBResource
 from dbgpt.core import (
     LLMClient,
@@ -56,24 +58,20 @@ _DEFAULT_SELECT_TABLE_PROMPT = """你是一个数据库专家，负责为用户�
 用户问题：查询每个用户的订单总金额
 输出：{{"tables": [{{"table": "orders", "relation": "通过 user_id 关联 user 表（多对一）"}}, {{"table": "user", "relation": "与 orders 通过 user_id 关联（一对多）"}}]}}
 
-示例2：
-用户问题：查询商品库存数量
-输出：{{"tables": [{{"table": "inventory", "relation": ""}}]}}
-
 要求：
 1. 表名必须与目录中的名字完全一致，原样输出，禁止编造、禁止改写大小写、禁止添加库名前缀。
 2. 只能从目录中选择表，禁止编造不存在的表名。
 3. 如果问题需要多张表，必须把建立关联所需的所有表都选出来；如果单表即可回答，只选一张，relation 留空字符串。
 4. 选表数量尽量精简，一般不要超过 {max_selected_tables} 张。
-5. 输出严格 JSON，不要包含任何其他解释文字，格式如下：
+5. 多表关联时，每张选中的表都必须填写 relation，描述该表与其他表的关联关系，不能留空：
+   - 如果该表通过某字段关联其他表（事实表），写"通过 XX 字段关联 YY 表（多对一）"，如：通过 user_id 关联 user 表（多对一）；
+   - 如果该表是被其他表引用的维度表，写"被 YY 表通过 XX 字段引用（一对多）"，如：被 orders 表通过 user_id 引用（一对多）。
+6. 输出严格 JSON，不要包含任何其他解释文字，格式如下：
 {{
   "tables": [
     {{"table": "表名", "relation": "该表与其他表的关联关系说明，如：通过 user_id 关联 user 表（多对一）"}}
   ]
 }}
-
-用户问题：
-{user_input}
 """
 
 _PARAMETER_DATASOURCE = Parameter.build_from(
@@ -95,9 +93,10 @@ _PARAMETER_PROMPT_TEMPLATE = Parameter.build_from(
     default=_DEFAULT_SELECT_TABLE_PROMPT,
     description=_(
         "选表提示词（可选，默认已内置中文提示词）："
-        "这是交给 LLM 让它从全量表目录中挑选相关表并判断表间关联关系的指令模板，"
+        "这是交给 LLM 让它从全量表目录中挑选相关表并判断表间关联关系的指令模板（system 消息），"
         "模板中可使用的占位符：{db_name} 数据库名、{table_catalog} 全量表目录、"
-        "{user_input} 用户问题、{max_selected_tables} 最大可选表数。"
+        "{max_selected_tables} 最大可选表数。"
+        "用户问题不写在模板里，代码会自动作为 user 消息追加在提示词后面。"
         "当发现选表不准（选错表/漏选关联表）时，可以在这里调整指令；"
         "注意模板中的 JSON 示例花括号需要写成 {{ }} 双花括号（代码渲染时会还原为单花括号）。"
     ),
@@ -237,7 +236,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
         参数说明：
             datasource: 数据源资源（必填），用于读取表名/注释/字段
-            prompt_template: 选表提示词模板，占位符支持 {db_name}/{table_catalog}/{user_input}/{max_selected_tables}
+            prompt_template: 选表提示词模板，占位符支持 {db_name}/{table_catalog}/{max_selected_tables}，用户问题自动作为 user 消息传入
             model: 选表使用的模型名称，留空用默认模型
             llm_client: LLM 客户端，留空用系统默认
             max_selected_tables: 最多加载几张选中表的全字段
@@ -276,8 +275,37 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             except Exception as e:
                 logger.warning(f"Get comment of table {table_name} failed: {e}")
             comment = str(comment).strip()
+            if not comment:
+                # Doris/StarRocks 等引擎 information_schema 不填充注释，改用 SHOW CREATE TABLE 解析
+                comment = await self._get_comment_by_show_create(
+                    connector, table_name
+                )
             catalog.append(f"{table_name} -- {comment}" if comment else table_name)
         return catalog
+
+    async def _get_comment_by_show_create(self, connector, table_name: str) -> str:
+        """用 SHOW CREATE TABLE 解析表级 COMMENT，作为注释兜底。
+
+        information_schema 读不到注释时（如 Doris/StarRocks），SHOW CREATE TABLE 会带出
+        建表语句中的表级 COMMENT。列注释也是 COMMENT '...'，表级注释在语句末尾，
+        因此取最后一个匹配项。
+        """
+        try:
+            rows = await self.blocking_func_to_async(
+                connector.run, f"SHOW CREATE TABLE {table_name}"
+            )
+            if rows and len(rows) > 1 and len(rows[1]) > 1:
+                create_sql = str(rows[1][1])
+                matches = re.findall(
+                    r"COMMENT\s*(?:=\s*)?'((?:[^'\\\\]|\\\\.)*)'", create_sql
+                )
+                if matches:
+                    return matches[-1].replace("''", "'").strip()
+        except Exception as e:
+            logger.warning(
+                f"Get comment of table {table_name} by SHOW CREATE TABLE failed: {e}"
+            )
+        return ""
 
     # ---------------- 2. LLM 选表 + 关联 ----------------
     async def _select_tables(self, question: str, catalog: List[str]) -> List[dict]:
@@ -289,11 +317,15 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             prompt = self._prompt_template.format(
                 db_name=self._datasource._db_name,
                 table_catalog=catalog_str,
-                user_input=question,
                 max_selected_tables=self._max_selected_tables,
             )
+            logger.info(f"Select table prompt:\n{prompt}")
+            # system 放角色/目录/要求，user 放用户问题（DB-GPT 枚举用 HUMAN 表示用户消息）
             messages = [
-                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt)
+                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
+                ModelMessage(
+                    role=ModelMessageRoleType.HUMAN, content=f"用户问题：{question}"
+                ),
             ]
             model_request = await self._build_model_request(messages)
             model_output: ModelOutput = await self.llm_client.generate(model_request)
@@ -410,8 +442,11 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         return "\n\n".join(schemas)
 
     # ---------------- 主流程 ----------------
-    async def map(self, question: str) -> HOContextBody:
-        """执行语义层检索。"""
+    async def _run_schema_linking(self, question: str) -> dict:
+        """执行语义层三步流程（目录 -> 选表+关联 -> 全字段），返回结果字典。
+
+        供普通检索算子（map）与 Agent 版算子（map）共用。
+        """
         db_name = self._datasource._db_name
         dialect = self._datasource.dialect
 
@@ -431,12 +466,105 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
         # 3. 按选中表加载全字段
         schemas_text = await self._load_table_schemas(selected, catalog)
+        return {
+            "db_name": db_name,
+            "dialect": dialect,
+            "selected_text": selected_text,
+            "schemas_text": schemas_text,
+        }
 
+    async def map(self, question: str) -> HOContextBody:
+        """执行语义层检索。"""
+        result = await self._run_schema_linking(question)
         context = (
-            f"数据库名: {db_name}\n"
-            f"方言: {dialect}\n\n"
-            f"根据用户问题选择的表及表间关联关系:\n{selected_text}\n\n"
-            f"选中表的完整表结构（字段、类型、主键、注释）:\n{schemas_text}\n\n"
+            f"数据库名: {result['db_name']}\n"
+            f"方言: {result['dialect']}\n\n"
+            f"根据用户问题选择的表及表间关联关系:\n{result['selected_text']}\n\n"
+            f"选中表的完整表结构（字段、类型、主键、注释）:\n{result['schemas_text']}\n\n"
             f"用户问题:\n{question}"
         )
+        logger.info(f"Schema linking context:\n{context}")
         return HOContextBody(context_key=self._context_key, context=context)
+
+
+class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
+    """Agent 语义层算子（Agent Schema Linking Operator）。
+
+    用于在 AWEL Agent 流程中串联语义层：
+      1. 接收上游 Agent 触发器输出的 AgentGenerateContext，取出其中的用户问题；
+      2. 执行两阶段语义层（全表目录 -> LLM 选表+关联 -> 按选中表加载全字段）；
+      3. 把选好的表结构与用户问题一并写入消息内容（作为 user 消息），
+         让下游 Agent（如 DataScientist）严格按语义层选出的表生成 SQL；
+      4. 原样透传 AgentGenerateContext 给下游 AWEL Agent Operator。
+
+    典型接线（画布）：
+      Agent Trigger.out.0 (Agent Operator Context)
+        -> 本算子.in.0 (Agent Operator Context)
+      数据源资源 -> 本算子.参数.datasource
+      本算子.out.0 (Agent Operator Context)
+        -> AWEL Agent Operator.in.0（Agent 选择 DataScientist）
+    """
+
+    metadata = ViewMetadata(
+        label=_("Agent Schema Linking Operator"),
+        name="agent_schema_linking_operator",
+        description=_(
+            "在 Agent 流程中执行语义层：接收上游 Agent 触发器输出的 AgentGenerateContext，"
+            "取其中的用户问题，执行“全表目录 -> LLM 选表+关联 -> 加载选中表全字段”，"
+            "把选好的表结构与用户问题写入消息内容（user 消息），"
+            "让下游 Agent 算子（如 DataScientist）严格按语义层选出的表生成 SQL，"
+            "然后原样透传 AgentGenerateContext。"
+        ),
+        category=OperatorCategory.AGENT,
+        parameters=[
+            _PARAMETER_DATASOURCE.new(),
+            _PARAMETER_PROMPT_TEMPLATE.new(),
+            _PARAMETER_MODEL.new(),
+            _PARAMETER_LLM_CLIENT.new(),
+            _PARAMETER_MAX_SELECTED_TABLES.new(),
+        ],
+        inputs=[
+            IOField.build_from(
+                _("Agent Operator Context"),
+                "agent_operator_context",
+                AgentGenerateContext,
+                description=_(
+                    "上游 Agent 触发器输出的 AgentGenerateContext，"
+                    "本算子读取其中的用户问题并执行语义层选表，之后原样透传。"
+                ),
+            )
+        ],
+        outputs=[
+            IOField.build_from(
+                _("Agent Operator Context"),
+                "agent_operator_context",
+                AgentGenerateContext,
+                description=_(
+                    "透传的 AgentGenerateContext（消息内容已注入语义层选好的表结构与关联关系），"
+                    "接到 AWEL Agent Operator（DataScientist）的输入。"
+                ),
+            )
+        ],
+        tags={"order": TAGS_ORDER_HIGH},
+    )
+
+    async def map(self, input_value: AgentGenerateContext) -> AgentGenerateContext:
+        """执行语义层并把选表结果注入用户消息，然后原样透传。"""
+        if not input_value.message:
+            raise ValueError("The message is empty.")
+        question = input_value.message.content or ""
+        result = await self._run_schema_linking(question)
+        # 把语义层选好的表结构与用户问题一起作为 user 消息，约束 Agent 只使用这些表
+        input_value.message.content = (
+            "以下数据表已由语义层根据你的问题选好（含表间关联关系与完整表结构），"
+            "请严格使用这些表生成 SQL 进行数据分析，禁止使用除此之外的任何表，"
+            "禁止编造字段名，禁止添加库名前缀：\n\n"
+            f"根据用户问题选择的表及表间关联关系:\n{result['selected_text']}\n\n"
+            f"选中表的完整表结构（字段、类型、主键、注释）:\n{result['schemas_text']}\n\n"
+            f"用户问题:\n{question}"
+        )
+        logger.info(
+            f"Agent schema linking injected for db {result['db_name']}:\n"
+            f"{input_value.message.content}"
+        )
+        return input_value
