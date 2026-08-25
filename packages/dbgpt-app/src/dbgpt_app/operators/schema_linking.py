@@ -74,6 +74,21 @@ _DEFAULT_SELECT_TABLE_PROMPT = """你是一个数据库专家，负责为用户�
 }}
 """
 
+_DEFAULT_SELECT_VALUE_FIELDS_PROMPT = """你是一个数据库专家。下面是语义层根据用户问题选出的数据表及其完整字段定义（格式：字段名 类型 [主键] -- 注释）：
+
+{schemas}
+
+请判断：为了正确生成 SQL 的 WHERE 过滤条件，哪些字段的真实取值可能有参考价值？
+只要该字段的取值在 SQL 中可能被用到（例如可能用于 WHERE 过滤、分组、精确匹配、模糊匹配，或取值属于枚举型/有限集合/大小写敏感需要原样书写的字段：品类、状态、日期、品牌、类型、ID 等），都应该选出来。
+
+宁可多选也不要漏选：只要觉得可能有参考价值的字段都选出来，LLM 写 SQL 时参考真实取值可以避免猜错过滤值（取值猜错会导致过滤条件错误、查不到结果）。
+
+输出每张表最多 5 个这样的字段（优先选最可能有参考价值的），格式为严格 JSON（只输出 JSON，不要任何解释）：
+{{"value_fields": {{"表名1": ["字段a", "字段b"], "表名2": ["字段c"]}}}}
+
+如果某张表确实没有任何需要参考取值的字段，该表就不出现在结果中。
+"""
+
 _PARAMETER_DATASOURCE = Parameter.build_from(
     _("Datasource"),
     "datasource",
@@ -159,6 +174,33 @@ _PARAMETER_CONTEXT_KEY = Parameter.build_from(
     ),
 )
 
+_PARAMETER_ENUM_ENABLED = Parameter.build_from(
+    _("Value Enumeration"),
+    "enum_enabled",
+    type=bool,
+    optional=True,
+    default=True,
+    description=_(
+        "值域枚举开关（可选，默认开启）："
+        "开启后，语义层会对选表时 LLM 指定的 value_fields 字段查询真实取值（含频次），"
+        "附在表结构后面，帮助 LLM 写对 WHERE 条件值"
+        "（例如知道品类值实际是“咖啡机（配件）”而不是“咖啡机”）。设为 false 关闭。"
+    ),
+)
+
+_PARAMETER_ENUM_LIMIT = Parameter.build_from(
+    _("Value Enum Limit"),
+    "enum_limit",
+    type=int,
+    optional=True,
+    default=3,
+    description=_(
+        "值域枚举上限（可选，默认 3）："
+        "每个字段按频次降序列出最常见的真实取值，只列前 N 个，"
+        "不展示频次，避免撑大提示词。"
+    ),
+)
+
 _INPUTS_QUESTION = IOField.build_from(
     _("User question"),
     "query",
@@ -216,6 +258,8 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             _PARAMETER_LLM_CLIENT.new(),
             _PARAMETER_MAX_SELECTED_TABLES.new(),
             _PARAMETER_CONTEXT_KEY.new(),
+            _PARAMETER_ENUM_ENABLED.new(),
+            _PARAMETER_ENUM_LIMIT.new(),
         ],
         inputs=[_INPUTS_QUESTION.new()],
         outputs=[_OUTPUTS_CONTEXT.new()],
@@ -230,6 +274,8 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         llm_client: Optional[LLMClient] = None,
         max_selected_tables: int = 5,
         context_key: Optional[str] = "context",
+        enum_enabled: bool = True,
+        enum_limit: int = 30,
         **kwargs,
     ):
         """初始化语义层检索算子。
@@ -241,6 +287,8 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             llm_client: LLM 客户端，留空用系统默认
             max_selected_tables: 最多加载几张选中表的全字段
             context_key: 输出上下文对象的键名，默认 "context"，与下游提示词 {context} 对应
+            enum_enabled: 是否对 LLM 指定的 value_fields 字段枚举真实取值（默认开启）
+            enum_limit: 每个字段最多枚举多少个取值（默认 30）
         """
         MapOperator.__init__(self, **kwargs)
         MixinLLMOperator.__init__(self, llm_client, save_model_output=False)
@@ -249,6 +297,8 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         self._model = model
         self._max_selected_tables = max_selected_tables
         self._context_key = context_key
+        self._enum_enabled = enum_enabled
+        self._enum_limit = enum_limit
 
     # ---------------- 1. 全量轻目录 ----------------
     async def _build_table_catalog(self) -> List[str]:
@@ -381,43 +431,22 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 return comment.split(sep, 1)[0].strip()
         return comment
 
-    async def _load_table_schemas(self, selected: List[dict], catalog: List[str]) -> str:
-        """按选中的表加载完整字段（不截断，含类型/主键/注释）。
+    async def _build_schemas_text(
+        self,
+        table_names: List[str],
+        catalog_comments: dict,
+        columns_by_table: dict,
+        value_fields_map: dict,
+    ) -> str:
+        """按选中表拼装完整表结构文本（字段/类型/主键/注释 + 值域枚举）。
 
         表注释只展示业务含义（第一个分号前），分号后的关联关系不重复展示，
         关联关系已由"根据用户问题选择的表及表间关联关系"节给出。
         """
         connector = self._datasource.connector
-        catalog_tables = {item.split(" -- ")[0] for item in catalog}
-        # 表名 -> 表注释（从目录中获取）
-        catalog_comments = {}
-        for item in catalog:
-            parts = item.split(" -- ", 1)
-            catalog_comments[parts[0]] = parts[1] if len(parts) > 1 else ""
-        # 去重并限制数量，过滤掉目录里不存在的表（防止 LLM 编造表名）
-        seen = set()
-        table_names = []
-        for item in selected:
-            name = item["table"]
-            if name in seen or name not in catalog_tables:
-                continue
-            seen.add(name)
-            table_names.append(name)
-            if len(table_names) >= self._max_selected_tables:
-                break
-        if not table_names:
-            logger.warning("No valid selected tables, fallback to all tables")
-            table_names = list(catalog_tables)[: self._max_selected_tables]
-
         schemas = []
         for table_name in table_names:
-            try:
-                columns = await self.blocking_func_to_async(
-                    connector.get_columns, table_name
-                )
-            except Exception as e:
-                logger.warning(f"Get columns of table {table_name} failed: {e}")
-                columns = []
+            columns = columns_by_table.get(table_name, [])
             col_lines = []
             for col in columns:
                 name = col.get("name", "")
@@ -438,12 +467,151 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 )
             else:
                 schema = f"{table_name}(\n" + "\n".join(col_lines) + "\n)"
+            # 值域枚举：对 LLM 确认的 value_fields 字段一次查询多字段，
+            # 取最常见的 N 行真实取值组合（每行各值横向对应字段名顺序）；
+            # 帮助 LLM 写对 WHERE 条件值（如品类值实际是"咖啡机（配件）"而非"咖啡机"）
+            if self._enum_enabled:
+                vf_list = value_fields_map.get(table_name, [])
+                if vf_list:
+                    # 行数上限：画布参数可调，但硬性封顶 3 行，避免撑大提示词
+                    enum_limit = min(self._enum_limit, 3)
+                    rows = await self._enumerate_field_values(
+                        connector, table_name, vf_list, enum_limit
+                    )
+                    if rows:
+                        header = (
+                            "    "
+                            + "，".join(vf_list)
+                            + f" 取值（真实数据，前{len(rows)}行）:"
+                        )
+                        value_lines = [
+                            "    " + ", ".join(r) for r in rows
+                        ]
+                        schema += (
+                            "\n\n 字段取值参考（真实数据）:\n"
+                            + header
+                            + "\n"
+                            + "\n".join(value_lines)
+                        )
             schemas.append(schema)
         return "\n\n".join(schemas)
 
+    async def _select_value_fields(
+        self, question: str, columns_by_table: dict
+    ) -> dict:
+        """字段确认步骤：LLM 看到选中表完整字段后，指定需要参考真实取值的字段。
+
+        返回 {表名: [字段, ...]}；未开启值域枚举或 LLM 调用失败时返回空 dict。
+        """
+        if not self._enum_enabled:
+            return {}
+        schema_lines = []
+        for table_name, columns in columns_by_table.items():
+            if not columns:
+                continue
+            col_lines = []
+            for col in columns:
+                name = col.get("name", "")
+                col_type = col.get("type", "")
+                comment = str(col.get("comment") or "").strip()
+                if comment:
+                    col_lines.append(f"    {name} {col_type} -- {comment}")
+                else:
+                    col_lines.append(f"    {name} {col_type}")
+            schema_lines.append(f"{table_name}(\n" + "\n".join(col_lines) + "\n)")
+        if not schema_lines:
+            return {}
+        try:
+            prompt = _DEFAULT_SELECT_VALUE_FIELDS_PROMPT.format(
+                schemas="\n\n".join(schema_lines)
+            )
+            logger.info(f"Select value fields prompt:\n{prompt}")
+            messages = [
+                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
+                ModelMessage(
+                    role=ModelMessageRoleType.HUMAN, content=f"用户问题：{question}"
+                ),
+            ]
+            model_request = await self._build_model_request(messages)
+            model_output: ModelOutput = await self.llm_client.generate(model_request)
+            return self._parse_value_fields(model_output.text)
+        except Exception as e:
+            logger.warning(f"LLM select value fields failed, skip: {e}")
+            return {}
+
+    def _parse_value_fields(self, text: str) -> dict:
+        """解析 LLM 输出的 value_fields JSON，返回 {表名: [字段, ...]}。"""
+        text = text.strip()
+        try:
+            data = json.loads(text)
+        except Exception:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                raise ValueError(f"Can not parse LLM output: {text}")
+            data = json.loads(text[start : end + 1])
+        vf_map = data.get("value_fields") or {}
+        result = {}
+        for table, fields in vf_map.items():
+            if not isinstance(fields, list):
+                continue
+            cleaned = [f for f in fields if isinstance(f, str) and f.strip()][:5]
+            if cleaned:
+                result[str(table)] = cleaned
+        return result
+
+    async def _enumerate_field_values(
+        self, connector, table_name: str, fields: List[str], limit: int
+    ) -> List[List[str]]:
+        """查询多个字段的前 N 行真实数据，供 LLM 写 WHERE 条件时参考。
+
+        直接取表的前 limit 行原始记录（不做聚合、不按频次排序），
+        返回行内各值顺序与 fields 一致，形如 [["其他配件", "生活家居配件", ...], ...]。
+        空值显示为空字符串；查询失败（字段不存在、表不可读等）时静默返回空列表，不影响主流程。
+        """
+        fields_sql = ", ".join(fields)
+        try:
+            rows = await self.blocking_func_to_async(
+                connector.run,
+                f"SELECT {fields_sql} FROM {table_name} LIMIT {limit}",
+            )
+        except Exception as e:
+            logger.warning(
+                f"Enumerate values of {table_name}.{fields} failed: {e}"
+            )
+            return []
+        result = []
+        for row in rows:
+            if isinstance(row, dict):
+                row_values = [str(row.get(f) or "") for f in fields]
+            else:
+                # list/tuple 或 SQLAlchemy Row 对象（均支持索引访问）
+                try:
+                    first = row[0]
+                except (IndexError, TypeError, KeyError):
+                    continue
+                # RDBMSConnector._query 会把列名作为首行插入（即 fields 列名），跳过该表头行
+                if first in fields:
+                    continue
+                row_values = []
+                for i in range(len(fields)):
+                    try:
+                        v = row[i]
+                    except (IndexError, TypeError, KeyError):
+                        v = None
+                    if v is None:
+                        row_values.append("")
+                        continue
+                    text = str(v)
+                    if len(text) > 20:
+                        text = text[:20] + "..."
+                    row_values.append(text)
+            result.append(row_values)
+        return result
+
     # ---------------- 主流程 ----------------
     async def _run_schema_linking(self, question: str) -> dict:
-        """执行语义层三步流程（目录 -> 选表+关联 -> 全字段），返回结果字典。
+        """执行语义层流程（目录 -> 选表+关联 -> 加载字段 -> 字段确认 -> 全字段+值域枚举）。
 
         供普通检索算子（map）与 Agent 版算子（map）共用。
         """
@@ -464,8 +632,44 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         else:
             selected_text = "- (LLM 未返回有效选表结果)"
 
-        # 3. 按选中表加载全字段
-        schemas_text = await self._load_table_schemas(selected, catalog)
+        # 3. 过滤选中表（防止 LLM 编造表名）并加载完整字段
+        connector = self._datasource.connector
+        catalog_tables = {item.split(" -- ")[0] for item in catalog}
+        seen = set()
+        table_names = []
+        for item in selected:
+            name = item["table"]
+            if name in seen or name not in catalog_tables:
+                continue
+            seen.add(name)
+            table_names.append(name)
+            if len(table_names) >= self._max_selected_tables:
+                break
+        if not table_names:
+            logger.warning("No valid selected tables, fallback to all tables")
+            table_names = list(catalog_tables)[: self._max_selected_tables]
+
+        columns_by_table = {}
+        for t in table_names:
+            try:
+                columns_by_table[t] = await self.blocking_func_to_async(
+                    connector.get_columns, t
+                )
+            except Exception as e:
+                logger.warning(f"Get columns of table {t} failed: {e}")
+                columns_by_table[t] = []
+
+        # 4. 字段确认：LLM 看到选中表完整字段后，指定需要参考真实取值的字段
+        value_fields_map = await self._select_value_fields(question, columns_by_table)
+
+        # 5. 拼装表结构（含字段取值参考）
+        catalog_comments = {}
+        for item in catalog:
+            parts = item.split(" -- ", 1)
+            catalog_comments[parts[0]] = parts[1] if len(parts) > 1 else ""
+        schemas_text = await self._build_schemas_text(
+            table_names, catalog_comments, columns_by_table, value_fields_map
+        )
         return {
             "db_name": db_name,
             "dialect": dialect,
@@ -522,6 +726,8 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             _PARAMETER_MODEL.new(),
             _PARAMETER_LLM_CLIENT.new(),
             _PARAMETER_MAX_SELECTED_TABLES.new(),
+            _PARAMETER_ENUM_ENABLED.new(),
+            _PARAMETER_ENUM_LIMIT.new(),
         ],
         inputs=[
             IOField.build_from(
@@ -558,7 +764,10 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         input_value.message.content = (
             "以下数据表已由语义层根据你的问题选好（含表间关联关系与完整表结构），"
             "请严格使用这些表生成 SQL 进行数据分析，禁止使用除此之外的任何表，"
-            "禁止编造字段名，禁止添加库名前缀：\n\n"
+            "禁止编造字段名，禁止添加库名前缀。"
+            "必须完整实现用户问题的所有量化要求：例如 TOP3/前N/排名必须用窗口函数"
+            "或 LIMIT 取前N，枚举类过滤值不确定时用 LIKE 模糊匹配，聚合、分组、排序"
+            "与问题口径一致；生成 SQL 后逐项自查是否满足。\n\n"
             f"根据用户问题选择的表及表间关联关系:\n{result['selected_text']}\n\n"
             f"选中表的完整表结构（字段、类型、主键、注释）:\n{result['schemas_text']}\n\n"
             f"用户问题:\n{question}"
