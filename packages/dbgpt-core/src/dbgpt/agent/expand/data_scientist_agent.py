@@ -96,6 +96,11 @@ class DataScientistAgent(ConversableAgent):
             "display_type": self.actions[0].render_prompt(),
             "dialect": self.database.dialect,
         }
+        # AgentMessage.success 默认 True，会让"重试纠错反馈（Human 行）"和
+        # "未通过校验的中间回复（DS 行）"在写入 gpts_messages 时 is_success=1，
+        # 与真实校验结果不符。这里统一先置 False：中间消息如实记录 is_success=0，
+        # 最终成败由 base_agent.generate_reply 循环结束时按 verify 结果赋给最后一条消息。
+        reply_message.success = False
         return reply_message
 
     @property
@@ -124,7 +129,24 @@ class DataScientistAgent(ConversableAgent):
                 False,
                 f"Please check your answer, {action_out.content}.",
             )
-        action_reply_obj = json.loads(action_out.content)
+        # action_report.content 理论上是合法 JSON，但一旦不是（如 LLM 输出畸形），
+        # json.loads/非 dict 的 .get 会抛异常，直接冲出 correctness_check 被
+        # generate_reply 最外层 except 捕获，导致整轮重试中断且原因不可读。
+        # 这里单独兜底，按普通校验失败返回明确原因，让重试机制正常工作。
+        try:
+            action_reply_obj = json.loads(action_out.content or "")
+        except Exception:
+            return (
+                False,
+                "Please check your answer, the output content is not valid JSON, "
+                "please regenerate a reply strictly in the required format.",
+            )
+        if not isinstance(action_reply_obj, dict):
+            return (
+                False,
+                "Please check your answer, the output content is not a valid JSON "
+                "object, please regenerate a reply strictly in the required format.",
+            )
         sql = action_reply_obj.get("sql", None)
         if not sql:
             return (
@@ -145,12 +167,19 @@ class DataScientistAgent(ConversableAgent):
                 db=action_out.resource_value,
             )
             if not values or len(values) <= 0:
-                return (
-                    False,
+                error_desc = (
                     "Please check your answer, the current SQL cannot find the data to "
                     "determine whether filtered field values or inappropriate filter "
-                    "conditions are used.",
+                    "conditions are used."
                 )
+                question = getattr(self, "_current_question", "") or ""
+                if question:
+                    # 让大模型判断错因并给出改造建议，作为重试反馈写入 gpts_messages，
+                    # 而不是只存一句静态文案，否则 Agent 重试时不知道具体改哪里
+                    return False, await self._analyze_failed_result(
+                        question, sql, error_desc
+                    )
+                return False, error_desc
             else:
                 logger.info(
                     f"reply check success! There are {len(values)} rows of data"
@@ -227,3 +256,60 @@ class DataScientistAgent(ConversableAgent):
         except Exception as e:
             logger.warning(f"LLM result check failed, skip: {e}")
         return True, None
+
+    async def _analyze_failed_result(
+        self, question: str, sql: str, error_desc: str
+    ) -> str:
+        """让大模型分析 SQL 校验失败的原因并给出改造建议。
+
+        返回的文本会作为失败原因写入 gpts_messages（重试反馈），
+        并在重试时作为输入指导 Agent 修正 SQL。
+        大模型不可用或输出解析失败时，回退到 error_desc 原文。
+        """
+        sys_prompt = (
+            "你是一个严谨的数据分析专家。数据分析 Agent 生成了一条 SQL，"
+            "但执行后校验失败。请结合用户问题、SQL 和失败原因，判断 SQL 错在哪里，"
+            "并给出具体可执行的改造建议。重点排查：\n"
+            "1. WHERE 过滤条件是否过严或写错（枚举值应模糊匹配却写成精确匹配、"
+            "大小写、空格、中文/英文差异）；\n"
+            "2. 时间范围口径是否与问题一致（近3个月/最近30天/上月/今年以来等"
+            "相对时间是否推算正确，日期写错会导致取到错误时段或空数据）；\n"
+            "3. 是否选错了表或字段；\n"
+            "4. 多表关联条件是否正确，是否因关联错误导致结果为空；\n"
+            "5. 聚合、分组、排序是否与问题要求一致。\n"
+            "只输出严格 JSON：{\"judgment\": \"对错误的判断\", \"suggestion\": \"具体改造建议（中文）\"}"
+        )
+        human = (
+            f"用户问题：{question}\n\n"
+            f"生成的 SQL：\n{sql}\n\n"
+            f"失败原因：{error_desc}"
+        )
+        try:
+            llm_client = self.not_null_llm_client
+            models = await llm_client.models()
+            if not models:
+                return error_desc
+            messages = [
+                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=sys_prompt),
+                ModelMessage(role=ModelMessageRoleType.HUMAN, content=human),
+            ]
+            request = ModelRequest.build_request(models[0].model, messages=messages)
+            output = await llm_client.generate(request)
+            text = (output.text or "").strip()
+            start, end = text.find("{"), text.rfind("}")
+            if start == -1 or end <= start:
+                return error_desc
+            result = json.loads(text[start : end + 1])
+            judgment = str(result.get("judgment") or "").strip()
+            suggestion = str(result.get("suggestion") or "").strip()
+            if not judgment and not suggestion:
+                return error_desc
+            parts = []
+            if judgment:
+                parts.append(f"校验失败原因：{judgment}")
+            if suggestion:
+                parts.append(f"改造建议：{suggestion}")
+            return "；".join(parts)
+        except Exception as e:
+            logger.warning(f"Analyze failed result error, skip: {e}")
+            return error_desc

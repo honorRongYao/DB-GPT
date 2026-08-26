@@ -1,4 +1,3 @@
-import re
 from datetime import datetime
 from typing import List, Optional
 
@@ -127,15 +126,10 @@ class GptsMessagesDao(BaseDao):
         # Extract results first to apply custom sorting
         results = gpts_messages.all()
 
-        # Custom sorting based on conv_id suffix and rounds
-        def get_suffix_number(entity):
-            suffix_match = re.search(r"_(\d+)$", entity.conv_id)
-            if suffix_match:
-                return int(suffix_match.group(1))
-            return 0  # Default for entries without a numeric suffix
-
-        # Sort first by numeric suffix, then by rounds
-        sorted_results = sorted(results, key=lambda x: (get_suffix_number(x), x.rounds))
+        # 按自增 id 排序：id 是真实写入顺序。rounds 在每一轮（每个 conv_id）内
+        # 从 0 重新计数，且重试时会回跳/跳号（离群值，如某条 rounds=1 实际是
+        # 最后写入），按 (conv_id 后缀, rounds) 排序会得到错误的会话顺序
+        sorted_results = sorted(results, key=lambda x: x.id)
         session.close()
         return sorted_results
 
@@ -144,7 +138,7 @@ class GptsMessagesDao(BaseDao):
         gpts_messages = session.query(GptsMessagesEntity)
         if conv_id:
             gpts_messages = gpts_messages.filter(GptsMessagesEntity.conv_id == conv_id)
-        result = gpts_messages.order_by(GptsMessagesEntity.rounds).all()
+        result = gpts_messages.order_by(GptsMessagesEntity.id).all()
         session.close()
         return result
 
@@ -176,7 +170,7 @@ class GptsMessagesDao(BaseDao):
             gpts_messages = gpts_messages.filter(
                 GptsMessagesEntity.current_goal == current_goal
             )
-        result = gpts_messages.order_by(GptsMessagesEntity.rounds).all()
+        result = gpts_messages.order_by(GptsMessagesEntity.id).all()
         session.close()
         return result
 
@@ -186,7 +180,7 @@ class GptsMessagesDao(BaseDao):
         if conv_id:
             gpts_messages = gpts_messages.filter(
                 GptsMessagesEntity.conv_id == conv_id
-            ).order_by(desc(GptsMessagesEntity.rounds))
+            ).order_by(desc(GptsMessagesEntity.id))
 
         result = gpts_messages.first()
         session.close()

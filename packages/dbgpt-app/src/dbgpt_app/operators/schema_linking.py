@@ -18,7 +18,7 @@
 import json
 import logging
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from dbgpt.agent import AgentGenerateContext
 from dbgpt.agent.resource.database import DBResource
@@ -63,10 +63,11 @@ _DEFAULT_SELECT_TABLE_PROMPT = """你是一个数据库专家，负责为用户�
 2. 只能从目录中选择表，禁止编造不存在的表名。
 3. 如果问题需要多张表，必须把建立关联所需的所有表都选出来；如果单表即可回答，只选一张，relation 留空字符串。
 4. 选表数量尽量精简，一般不要超过 {max_selected_tables} 张。
-5. 多表关联时，每张选中的表都必须填写 relation，描述该表与其他表的关联关系，不能留空：
+5. 当用户问题中的过滤概念（品类、品牌、状态、类型、名称等业务维度）在事实表中只有外键（如 category_id）而没有对应的名称字段时，必须把该维度表一并选出用于 WHERE 过滤；宁可多选一张表，也不能让过滤条件无法准确表达。漏选维度表是常见错误，会导致 SQL 过滤条件错误、结果不准。
+6. 多表关联时，每张选中的表都必须填写 relation，描述该表与其他表的关联关系，不能留空：
    - 如果该表通过某字段关联其他表（事实表），写"通过 XX 字段关联 YY 表（多对一）"，如：通过 user_id 关联 user 表（多对一）；
    - 如果该表是被其他表引用的维度表，写"被 YY 表通过 XX 字段引用（一对多）"，如：被 orders 表通过 user_id 引用（一对多）。
-6. 输出严格 JSON，不要包含任何其他解释文字，格式如下：
+7. 输出严格 JSON，不要包含任何其他解释文字，格式如下：
 {{
   "tables": [
     {{"table": "表名", "relation": "该表与其他表的关联关系说明，如：通过 user_id 关联 user 表（多对一）"}}
@@ -88,6 +89,58 @@ _DEFAULT_SELECT_VALUE_FIELDS_PROMPT = """你是一个数据库专家。下面是
 
 如果某张表确实没有任何需要参考取值的字段，该表就不出现在结果中。
 """
+
+_DEFAULT_VERIFY_TABLES_PROMPT = """你是一个数据库专家。下面是初步选出的数据表（含字段列表与表注释），以及数据库中全部可用表的目录。
+
+当前已选表：
+{selected_tables}
+
+全表目录（补充表只能从这里选）：
+{table_catalog}
+
+请校验：当前已选表的字段，是否足以完整回答用户问题（包括 WHERE 过滤、聚合、分组、排序所需的全部维度）？重点检查：
+1. 用户问题中出现的业务过滤概念（品类、品牌、状态、类型、名称等），已选表中是否有对应的名称字段可直接表达？
+   如果只有外键（如 category_id）而没有名称字段（如 category_1、category_2），则缺少对应的维度表，必须补充。
+2. 统计口径所需字段（销量、金额、时间等）是否齐全。
+3. 时间等过滤字段是否存在，字段类型是否与问题口径匹配（如日期是 date、年月是 varchar 格式 202607）。
+
+若已选表已足够，输出：{{"sufficient": true, "missing_tables": []}}
+若不足，从全表目录中选出缺失的表（可多张），输出：
+{{"sufficient": false, "missing_tables": [{{"table": "表名", "reason": "补充原因"}}]}}
+
+要求：
+1. 表名必须与全表目录完全一致，禁止编造。
+2. 只补充真正缺失的表，不要重复已选中的表。
+3. 输出严格 JSON，不要包含任何其他解释文字。
+"""
+
+_DEFAULT_REWRITE_QUESTION_PROMPT = """你是一个对话理解助手。下面是当前用户问题出现之前的最近几轮对话记录：
+
+{history}
+
+请判断：当前用户问题是否引用了前文对话中的内容？
+判断依据（满足任意一条即可认为引用了前文）：
+1. 出现指代词：那、这个、它、上面、刚才、环比、同比、继续、再、还、结果、数据等；
+2. 缺少主语或实体：没有明确提到品类/品牌/表/统计对象；
+3. 缺少时间基准或统计口径：如"环比是多少"没有说明对比的是哪一期、哪个范围的数据；
+4. 与前一问属于同一话题的追问。
+
+- 若引用了前文，把当前问题改写为一个自包含的完整问题：把前文中的实体（品类/品牌/商品等）、
+时间范围（如 Q1、202601-202603）、过滤条件、统计口径明确写进问题，
+使改写后的问题脱离前文也能独立理解。
+- 若没有引用前文，保持原问题不变，原样输出。
+
+只输出严格 JSON，不要包含任何其他解释文字：
+{{"related": true 或 false, "rewritten_question": "改写后的完整问题（related 为 false 时与原问题相同）"}}
+"""
+
+# 追问补全相关常量：历史只取最近几轮、单条内容截断，避免上下文撑爆模型输入
+_REWRITE_HISTORY_MAX_MESSAGES = 6
+_REWRITE_HISTORY_MAX_CHARS = 200
+# 标准 DB-GPT 对话中 UserProxyAgent 的 role，用于按真实 conv_id 模糊检索整段会话历史
+_REWRITE_HISTORY_ROLE = "Human"
+_SCHEMA_LINKING_INJECT_MARKER = "以下数据表已由语义层根据你的问题选好"
+_SCHEMA_LINKING_QUESTION_MARKER = "用户问题:"
 
 _PARAMETER_DATASOURCE = Parameter.build_from(
     _("Datasource"),
@@ -369,7 +422,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 table_catalog=catalog_str,
                 max_selected_tables=self._max_selected_tables,
             )
-            logger.info(f"Select table prompt:\n{prompt}")
+            # logger.info(f"Select table prompt:\n{prompt}")
             # system 放角色/目录/要求，user 放用户问题（DB-GPT 枚举用 HUMAN 表示用户消息）
             messages = [
                 ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
@@ -525,7 +578,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             prompt = _DEFAULT_SELECT_VALUE_FIELDS_PROMPT.format(
                 schemas="\n\n".join(schema_lines)
             )
-            logger.info(f"Select value fields prompt:\n{prompt}")
+            # logger.info(f"Select value fields prompt:\n{prompt}")
             messages = [
                 ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
                 ModelMessage(
@@ -559,6 +612,216 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             if cleaned:
                 result[str(table)] = cleaned
         return result
+
+    # ---------------- 3.5 二次兜底：选表校验 + 补充缺失表 ----------------
+    def _parse_verify_result(self, text: str) -> Tuple[bool, List[str]]:
+        """解析校验结果 JSON，返回 (是否足够, 缺失表名列表)。"""
+        text = text.strip()
+        try:
+            data = json.loads(text)
+        except Exception:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                raise ValueError(f"Can not parse LLM output: {text}")
+            data = json.loads(text[start : end + 1])
+        sufficient = bool(data.get("sufficient", True))
+        missing = []
+        for item in data.get("missing_tables") or []:
+            if isinstance(item, dict) and item.get("table"):
+                missing.append(str(item["table"]))
+        return sufficient, missing
+
+    async def _verify_and_fix_tables(
+        self,
+        question: str,
+        catalog: List[str],
+        table_names: List[str],
+        columns_by_table: dict,
+    ) -> List[str]:
+        """二次兜底：校验已选表是否足以回答用户问题，不足则从目录补充缺失表。
+
+        针对"漏选维度表"这类问题：例如用户问"咖啡机Q1总销量"，销售表只有
+        category_id 外键、没有品类名称字段，校验会让 LLM 补充品类维度表。
+        只做表级补充，不修改已选表的字段；LLM 校验失败或解析失败时
+        静默保留原选表结果，不中断主流程。
+        """
+        if not table_names:
+            return table_names
+        catalog_comments = {}
+        for item in catalog:
+            parts = item.split(" -- ", 1)
+            catalog_comments[parts[0]] = parts[1] if len(parts) > 1 else ""
+        schema_lines = []
+        for t in table_names:
+            cols = columns_by_table.get(t, [])
+            col_names = ", ".join(c.get("name", "") for c in cols)
+            comment = catalog_comments.get(t, "")
+            schema_lines.append(f"{t} -- {comment}（字段：{col_names}）")
+        try:
+            prompt = _DEFAULT_VERIFY_TABLES_PROMPT.format(
+                selected_tables="\n".join(schema_lines),
+                table_catalog="\n".join(f"- {c}" for c in catalog),
+            )
+            # logger.info(f"Verify tables prompt:\n{prompt}")
+            messages = [
+                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
+                ModelMessage(
+                    role=ModelMessageRoleType.HUMAN, content=f"用户问题：{question}"
+                ),
+            ]
+            model_request = await self._build_model_request(messages)
+            model_output: ModelOutput = await self.llm_client.generate(model_request)
+            sufficient, missing = self._parse_verify_result(model_output.text)
+        except Exception as e:
+            logger.warning(f"LLM verify tables failed, keep original selection: {e}")
+            return table_names
+        if sufficient or not missing:
+            return table_names
+        catalog_tables = {item.split(" -- ")[0] for item in catalog}
+        result = list(table_names)
+        for name in missing:
+            if name not in catalog_tables or name in result:
+                continue
+            result.append(name)
+            if len(result) >= self._max_selected_tables:
+                break
+        added = [t for t in result if t not in table_names]
+        # if added:
+        #     logger.info(f"Verify tables: supplement missing tables {added}")
+        return result
+
+    # ---------------- 追问补全：结合历史对话，把指代问题改写为自包含完整问题 ----------------
+
+    @staticmethod
+    def _strip_schema_linking_text(content: str) -> str:
+        """去掉语义层注入到消息里的表结构文本，只保留真正的用户问题/回答内容。"""
+        if not content:
+            return ""
+        idx = content.find(_SCHEMA_LINKING_INJECT_MARKER)
+        if idx < 0:
+            return content
+        q_idx = content.find(_SCHEMA_LINKING_QUESTION_MARKER, idx)
+        if q_idx < 0:
+            return ""
+        return content[q_idx + len(_SCHEMA_LINKING_QUESTION_MARKER) :].strip()
+
+    @staticmethod
+    def _format_history_item(role_label: str, content: str) -> str:
+        """格式化一条历史消息：去掉注入文本、压缩空白、超长截断。"""
+        content = HOSchemaLinkingRetrieverOperator._strip_schema_linking_text(content)
+        content = " ".join(content.split())
+        if not content:
+            return ""
+        if len(content) > _REWRITE_HISTORY_MAX_CHARS:
+            content = content[:_REWRITE_HISTORY_MAX_CHARS] + "..."
+        return f"{role_label}: {content}"
+
+    async def _build_history_text_from_db(
+        self, input_value: AgentGenerateContext
+    ) -> str:
+        """从数据库 gpts_message 表读取同一会话的最近消息（与 Agent 记忆同源）。
+
+        注意：每一轮对话的 agent_conv_id 会带递增后缀（如 abc_1、abc_2），
+        而语义层执行时当前轮消息尚未入库，所以必须像 Agent 历史恢复那样
+        用真实 conv_id 做 LIKE 匹配（get_by_agent），而不是 get_by_conv_id 精确匹配。
+        取最近几轮拼成摘要；查询失败时静默返回空，由上层回退到原问题。
+        """
+        try:
+            agent_context = getattr(input_value, "agent_context", None)
+            conv_id = getattr(agent_context, "conv_id", None)
+            if not conv_id:
+                return ""
+            from dbgpt.agent.util.conv_utils import parse_conv_id
+            from dbgpt_serve.agent.agents.db_gpts_memory import (
+                MetaDbGptsMessageMemory,
+            )
+
+            real_conv_id, _ = parse_conv_id(conv_id)
+            # 标准 DB-GPT 对话中，UserProxyAgent 的 role 为 "Human"，
+            # 会话内每条消息的 sender 或 receiver 必有一方是 "Human"，故一次查询即可覆盖整段对话
+            message_memory = MetaDbGptsMessageMemory()
+            messages = await self.blocking_func_to_async(
+                message_memory.get_by_agent, real_conv_id, _REWRITE_HISTORY_ROLE
+            )
+            if not messages:
+                return ""
+            # DAO get_by_agent 已按 (conv_id 后缀, rounds) 排好序（即会话顺序），
+            # 不要用 rounds 重排：rounds 在每一轮（每个 conv_id）内都会从 0 重新计数，
+            # 按 (rounds, created_at) 重排会把多轮消息的顺序打乱（如 q1,q2,a1,a2）
+            history = []
+            for m in messages[-_REWRITE_HISTORY_MAX_MESSAGES:]:
+                content = (getattr(m, "content", None) or "").strip()
+                if not content:
+                    continue
+                role = (getattr(m, "role", None) or "").lower()
+                label = "用户" if role in ("human", "user") else "助手"
+                line = HOSchemaLinkingRetrieverOperator._format_history_item(
+                    label, content
+                )
+                if line:
+                    history.append(line)
+            return "\n".join(history)
+        except Exception as e:
+            logger.warning(f"Build history from db failed, skip: {e}")
+            return ""
+
+    def _parse_rewrite_result(self, text: str) -> Tuple[bool, str]:
+        """解析改写结果 JSON，返回 (是否引用了前文, 改写后的问题)。"""
+        text = text.strip()
+        try:
+            data = json.loads(text)
+        except Exception:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                raise ValueError(f"Can not parse LLM output: {text}")
+            data = json.loads(text[start : end + 1])
+        related = bool(data.get("related", False))
+        rewritten = str(data.get("rewritten_question") or "").strip()
+        return related, rewritten
+
+    async def _rewrite_followup_question(
+        self, question: str, input_value: AgentGenerateContext
+    ) -> str:
+        """追问补全：判断当前问题是否指代前文，若是则改写为自包含的完整问题。
+
+        历史来源：数据库 gpts_message 表（通过 agent_context.conv_id 查询，与
+        DataScientist 的会话记忆同源）。不读 rely_messages：AWEL Agent 流程中
+        语义层位于 Agent Trigger 之后、AWEL Agent Operator 之前，起始 context
+        未携带 rely_messages（实测恒为空），且 gpts_message 表是 rely 的严格超集。
+        历史不可用、或 LLM 判定/改写失败时，静默返回原问题，不阻塞主流程。
+        """
+        current = self._strip_schema_linking_text(question).strip()
+        history = await self._build_history_text_from_db(input_value)
+        if not history:
+            return question
+        try:
+            prompt = _DEFAULT_REWRITE_QUESTION_PROMPT.format(history=history)
+            messages = [
+                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
+                ModelMessage(
+                    role=ModelMessageRoleType.HUMAN,
+                    content=f"当前用户问题：{question}",
+                ),
+            ]
+            model_request = await self._build_model_request(messages)
+            model_output: ModelOutput = await self.llm_client.generate(model_request)
+            related, rewritten = self._parse_rewrite_result(model_output.text)
+        except Exception as e:
+            logger.warning(
+                f"Rewrite followup question failed, keep original question: {e}"
+            )
+            return question
+        if (
+            not related
+            or not rewritten
+            or rewritten == current
+            or rewritten == question
+        ):
+            return question
+        # logger.info(f"Rewrite followup question: {question} -> {rewritten}")
+        return rewritten
 
     async def _enumerate_field_values(
         self, connector, table_name: str, fields: List[str], limit: int
@@ -659,6 +922,28 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 logger.warning(f"Get columns of table {t} failed: {e}")
                 columns_by_table[t] = []
 
+        # 3.5 二次兜底：校验已选表是否足以回答用户问题，不足则从目录补充缺失表
+        # （例如"咖啡机Q1总销量"：销售表只有 category_id 外键、无品类名称字段，
+        #  校验会让 LLM 补充品类维度表，避免漏选维度表导致过滤条件错误）
+        fixed_table_names = await self._verify_and_fix_tables(
+            question, catalog, table_names, columns_by_table
+        )
+        added_tables = [t for t in fixed_table_names if t not in table_names]
+        if added_tables:
+            table_names = fixed_table_names
+            # 补充的表也加入选中列表，保证"选中的表及关联关系"与表结构一致
+            selected.extend(
+                {"table": t, "relation": "二次校验补充"} for t in added_tables
+            )
+            for t in added_tables:
+                try:
+                    columns_by_table[t] = await self.blocking_func_to_async(
+                        connector.get_columns, t
+                    )
+                except Exception as e:
+                    logger.warning(f"Get columns of table {t} failed: {e}")
+                    columns_by_table[t] = []
+
         # 4. 字段确认：LLM 看到选中表完整字段后，指定需要参考真实取值的字段
         value_fields_map = await self._select_value_fields(question, columns_by_table)
 
@@ -687,7 +972,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             f"选中表的完整表结构（字段、类型、主键、注释）:\n{result['schemas_text']}\n\n"
             f"用户问题:\n{question}"
         )
-        logger.info(f"Schema linking context:\n{context}")
+        # logger.info(f"Schema linking context:\n{context}")
         return HOContextBody(context_key=self._context_key, context=context)
 
 
@@ -696,10 +981,13 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
 
     用于在 AWEL Agent 流程中串联语义层：
       1. 接收上游 Agent 触发器输出的 AgentGenerateContext，取出其中的用户问题；
-      2. 执行两阶段语义层（全表目录 -> LLM 选表+关联 -> 按选中表加载全字段）；
-      3. 把选好的表结构与用户问题一并写入消息内容（作为 user 消息），
+      2. 追问补全：结合会话历史（数据库 gpts_message 表，与 Agent 记忆同源），
+         若当前问题指代前文（如"那环比是多少了"），
+         改写为自包含的完整问题，避免漏选维度表、口径错乱；
+      3. 执行两阶段语义层（全表目录 -> LLM 选表+关联 -> 按选中表加载全字段）；
+      4. 把选好的表结构与用户问题一并写入消息内容（作为 user 消息），
          让下游 Agent（如 DataScientist）严格按语义层选出的表生成 SQL；
-      4. 原样透传 AgentGenerateContext 给下游 AWEL Agent Operator。
+      5. 原样透传 AgentGenerateContext 给下游 AWEL Agent Operator。
 
     典型接线（画布）：
       Agent Trigger.out.0 (Agent Operator Context)
@@ -759,6 +1047,9 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         if not input_value.message:
             raise ValueError("The message is empty.")
         question = input_value.message.content or ""
+        # 追问补全：结合历史对话，把"那环比是多少了"这类指代问题改写为
+        # "咖啡机Q1销量环比上季度"的完整问题，避免漏选品类表、口径错乱
+        question = await self._rewrite_followup_question(question, input_value)
         result = await self._run_schema_linking(question)
         # 把语义层选好的表结构与用户问题一起作为 user 消息，约束 Agent 只使用这些表
         input_value.message.content = (
@@ -772,8 +1063,8 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             f"选中表的完整表结构（字段、类型、主键、注释）:\n{result['schemas_text']}\n\n"
             f"用户问题:\n{question}"
         )
-        logger.info(
-            f"Agent schema linking injected for db {result['db_name']}:\n"
-            f"{input_value.message.content}"
-        )
+        # logger.info(
+        #     f"Agent schema linking injected for db {result['db_name']}:\n"
+        #     f"{input_value.message.content}"
+        # )
         return input_value
