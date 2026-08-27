@@ -90,6 +90,29 @@ _DEFAULT_SELECT_VALUE_FIELDS_PROMPT = """你是一个数据库专家。下面是
 如果某张表确实没有任何需要参考取值的字段，该表就不出现在结果中。
 """
 
+_DEFAULT_VERIFY_VALUE_FIELDS_PROMPT = """你是数据库专家。下面是已选表中需要参考真实取值的字段，以及这些字段查到的真实数据（每字段最多3个取值）：
+
+{field_values}
+
+用户问题：{question}
+
+请判断：这些字段的真实取值，是否足以帮你正确写出 WHERE 过滤条件（品类、品牌、日期、状态等业务维度的取值是否准确、可用的过滤值是否齐全）？
+
+重点检查：
+1. 用户问题中出现的业务过滤概念（品类、品牌、商品类型等），是否已有字段能看到对应的真实取值？若取值里看不到问题提到的概念（如问题说"电动风扇"，但取值里只有"风扇/塔式风扇"），说明需要补充品类/标题类字段来确认真实叫法。
+2. 时间过滤字段（如 dt、date）是否有取值参考？
+3. 已选字段查出的取值是否异常（全空、类型不符、字段名错误）？
+
+若已足够，输出：{{"sufficient": true, "add_fields": {}}}
+若不足，从已选表的完整字段中补充字段，输出：
+{{"sufficient": false, "add_fields": {{"表名": ["补充字段1", "补充字段2"]}}}}
+
+要求：
+1. 只能补充已选表真实存在的字段，禁止编造字段名。
+2. 每张表补充字段不超过 5 个。
+3. 输出严格 JSON，不要包含任何其他解释文字。
+"""
+
 _DEFAULT_VERIFY_TABLES_PROMPT = """你是一个数据库专家。下面是初步选出的数据表（含字段列表与表注释），以及数据库中全部可用表的目录。
 
 当前已选表：
@@ -134,8 +157,8 @@ _DEFAULT_REWRITE_QUESTION_PROMPT = """你是一个对话理解助手。下面是
 {{"related": true 或 false, "rewritten_question": "改写后的完整问题（related 为 false 时与原问题相同）"}}
 """
 
-# 追问补全相关常量：历史只取最近几轮、单条内容截断，避免上下文撑爆模型输入
-_REWRITE_HISTORY_MAX_MESSAGES = 6
+# 追问补全相关常量：历史只取最近几轮（每轮只留头尾）、单条内容截断，避免上下文撑爆模型输入
+_REWRITE_HISTORY_MAX_ROUNDS = 5
 _REWRITE_HISTORY_MAX_CHARS = 200
 # 标准 DB-GPT 对话中 UserProxyAgent 的 role，用于按真实 conv_id 模糊检索整段会话历史
 _REWRITE_HISTORY_ROLE = "Human"
@@ -328,7 +351,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         max_selected_tables: int = 5,
         context_key: Optional[str] = "context",
         enum_enabled: bool = True,
-        enum_limit: int = 30,
+        enum_limit: int = 3,
         **kwargs,
     ):
         """初始化语义层检索算子。
@@ -341,7 +364,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             max_selected_tables: 最多加载几张选中表的全字段
             context_key: 输出上下文对象的键名，默认 "context"，与下游提示词 {context} 对应
             enum_enabled: 是否对 LLM 指定的 value_fields 字段枚举真实取值（默认开启）
-            enum_limit: 每个字段最多枚举多少个取值（默认 30）
+            enum_limit: 每个字段最多枚举多少个取值（默认 3，可调）
         """
         MapOperator.__init__(self, **kwargs)
         MixinLLMOperator.__init__(self, llm_client, save_model_output=False)
@@ -410,6 +433,85 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             )
         return ""
 
+    async def _get_columns_with_fallback(
+        self, connector, table_name: str
+    ) -> List[dict]:
+        """加载表字段；get_columns 失败/为空时用 SHOW CREATE TABLE 解析兜底。
+
+        Doris 等引擎的 information_schema 元数据查询慢，偶发连接超时
+        （Lost connection to MySQL server）或事务未回滚（Can't reconnect），
+        导致 get_columns 返回空或抛异常，表结构字段为空、LLM 只能猜字段名。
+        SHOW CREATE TABLE 走普通 SQL 执行（session_scope 自动提交/回滚），
+        对 Doris 支持可靠，作为字段加载的兜底。
+        """
+        try:
+            columns = await self.blocking_func_to_async(
+                connector.get_columns, table_name
+            )
+            if columns:
+                return columns
+        except Exception as e:
+            logger.warning(
+                f"get_columns of table {table_name} failed, "
+                f"try SHOW CREATE TABLE fallback: {e}"
+            )
+        try:
+            rows = await self.blocking_func_to_async(
+                connector.run, f"SHOW CREATE TABLE {table_name}"
+            )
+            if rows and len(rows) > 1 and len(rows[1]) > 1:
+                create_sql = str(rows[1][1])
+                return self._parse_columns_from_create_sql(create_sql)
+        except Exception as e:
+            logger.warning(
+                f"Parse columns of table {table_name} by SHOW CREATE TABLE failed: {e}"
+            )
+        return []
+
+    @staticmethod
+    def _parse_columns_from_create_sql(create_sql: str) -> List[dict]:
+        """从 SHOW CREATE TABLE 语句解析列定义（列名/类型/注释）。
+
+        与 connector.get_columns 返回结构兼容：name/type/comment/is_in_primary_key。
+        """
+        start = create_sql.find("(")
+        end = create_sql.rfind(")")
+        if start == -1 or end == -1 or end <= start:
+            return []
+        body = create_sql[start + 1 : end]
+        columns = []
+        for line in body.splitlines():
+            line = line.strip().rstrip(",").strip()
+            if not line:
+                continue
+            m = re.match(r"`([^`]+)`\s+", line)
+            if not m:
+                continue
+            name = m.group(1)
+            type_part = line[m.end() :].strip()
+            # 去掉 NULL / NOT NULL / DEFAULT / AUTO_INCREMENT / COMMENT 等修饰子句
+            type_part = re.split(
+                r"\s+(?:NULL|COMMENT|DEFAULT|AUTO_INCREMENT)\b|;\s*$",
+                type_part,
+                maxsplit=1,
+            )[0].strip()
+            comment = ""
+            cm = re.search(
+                r"COMMENT\s+[\"']([^\"']*)[\"']", line, re.IGNORECASE
+            )
+            if cm:
+                comment = cm.group(1)
+            columns.append(
+                {
+                    "name": name,
+                    "type": type_part,
+                    "default_expression": "",
+                    "is_in_primary_key": False,
+                    "comment": comment,
+                }
+            )
+        return columns
+
     # ---------------- 2. LLM 选表 + 关联 ----------------
     async def _select_tables(self, question: str, catalog: List[str]) -> List[dict]:
         """调用 LLM 从目录中选择相关表并判断关联关系。"""
@@ -422,7 +524,15 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 table_catalog=catalog_str,
                 max_selected_tables=self._max_selected_tables,
             )
-            # logger.info(f"Select table prompt:\n{prompt}")
+        except Exception as e:
+            logger.warning(
+                f"Select table prompt template format failed ({e}), "
+                f"fallback to all tables"
+            )
+            return [
+                {"table": t.split(" -- ", 1)[0], "relation": ""} for t in catalog
+            ]
+        try:
             # system 放角色/目录/要求，user 放用户问题（DB-GPT 枚举用 HUMAN 表示用户消息）
             messages = [
                 ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
@@ -449,16 +559,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
     def _parse_table_selection(self, text: str) -> List[dict]:
         """解析 LLM 输出的 JSON，提取选中的表及关联关系。"""
-        text = text.strip()
-        try:
-            data = json.loads(text)
-        except Exception:
-            # 去掉 ```json ... ``` 代码块包裹后重试
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                raise ValueError(f"Can not parse LLM output: {text}")
-            data = json.loads(text[start : end + 1])
+        data = self._parse_json_strict(text)
         tables = data.get("tables") or []
         result = []
         for item in tables:
@@ -469,6 +570,28 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                         "relation": str(item.get("relation") or ""),
                     }
                 )
+        return result
+
+    @staticmethod
+    def _parse_json_strict(text: str) -> dict:
+        """容错解析 LLM 输出的 JSON：优先整体解析，失败则截取首个 { 到最后一个 } 再解析。"""
+        text = text.strip()
+        try:
+            return json.loads(text)
+        except Exception:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                raise ValueError(f"Can not parse LLM output: {text}")
+            return json.loads(text[start : end + 1])
+
+    @staticmethod
+    def _build_catalog_comments(catalog: List[str]) -> dict:
+        """从目录项（"表名 -- 注释"）构建 {表名: 注释} 映射。"""
+        result = {}
+        for item in catalog:
+            parts = item.split(" -- ", 1)
+            result[parts[0]] = parts[1] if len(parts) > 1 else ""
         return result
 
     # ---------------- 3. 按选中表加载全字段 ----------------
@@ -526,10 +649,8 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             if self._enum_enabled:
                 vf_list = value_fields_map.get(table_name, [])
                 if vf_list:
-                    # 行数上限：画布参数可调，但硬性封顶 3 行，避免撑大提示词
-                    enum_limit = min(self._enum_limit, 3)
                     rows = await self._enumerate_field_values(
-                        connector, table_name, vf_list, enum_limit
+                        connector, table_name, vf_list, self._enum_limit
                     )
                     if rows:
                         header = (
@@ -578,7 +699,6 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             prompt = _DEFAULT_SELECT_VALUE_FIELDS_PROMPT.format(
                 schemas="\n\n".join(schema_lines)
             )
-            # logger.info(f"Select value fields prompt:\n{prompt}")
             messages = [
                 ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
                 ModelMessage(
@@ -594,15 +714,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
     def _parse_value_fields(self, text: str) -> dict:
         """解析 LLM 输出的 value_fields JSON，返回 {表名: [字段, ...]}。"""
-        text = text.strip()
-        try:
-            data = json.loads(text)
-        except Exception:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                raise ValueError(f"Can not parse LLM output: {text}")
-            data = json.loads(text[start : end + 1])
+        data = self._parse_json_strict(text)
         vf_map = data.get("value_fields") or {}
         result = {}
         for table, fields in vf_map.items():
@@ -613,18 +725,102 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 result[str(table)] = cleaned
         return result
 
+    @staticmethod
+    def _filter_value_fields(value_fields_map: dict, columns_by_table: dict) -> dict:
+        """过滤不存在的字段名，防止 LLM 编造字段污染 SELECT（如 *、拼错的列名）。
+
+        只保留该表真实存在的列；过滤后某表没有合法字段则整表移除。
+        """
+        result = {}
+        for table_name, fields in value_fields_map.items():
+            real_names = {c.get("name") for c in columns_by_table.get(table_name, [])}
+            cleaned = [f for f in fields if f in real_names]
+            if cleaned:
+                result[table_name] = cleaned
+        return result
+
+    # ---------------- 4.5 二次兜底：选值域字段校验 + 补充字段 ----------------
+    async def _verify_and_fix_value_fields(
+        self,
+        question: str,
+        columns_by_table: dict,
+        value_fields_map: dict,
+    ) -> dict:
+        """二次兜底：查已选值域字段的真实取值，LLM 判断是否足够，不足则补字段。
+
+        对标 _verify_and_fix_tables：先对已选字段查真实取值（limit 3），连同
+        用户问题交给 LLM，判断取值是否足以写对 WHERE（如问题说"电动风扇"但取值
+        里只有"风扇/塔式风扇"，就需要补品类/标题类字段确认真实叫法）。
+        需要时从该表真实字段中补充，去重后合并进 value_fields_map。
+        LLM 调用或解析失败时原样返回，不阻塞主流程。
+        """
+        if not self._enum_enabled or not value_fields_map:
+            return value_fields_map
+        connector = self._datasource.connector
+        field_lines = []
+        for table_name, fields in value_fields_map.items():
+            if not fields or not columns_by_table.get(table_name):
+                continue
+            rows = await self._enumerate_field_values(connector, table_name, fields, 3)
+            if not rows:
+                value_desc = "（未查到取值）"
+            else:
+                value_desc = "\n".join("  " + ", ".join(r) for r in rows)
+            field_lines.append(
+                f"{table_name} 字段 [{', '.join(fields)}] 真实取值:\n{value_desc}"
+            )
+        if not field_lines:
+            return value_fields_map
+        try:
+            prompt = _DEFAULT_VERIFY_VALUE_FIELDS_PROMPT.format(
+                field_values="\n\n".join(field_lines),
+                question=question,
+            )
+            messages = [
+                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
+                ModelMessage(
+                    role=ModelMessageRoleType.HUMAN,
+                    content=f"用户问题：{question}",
+                ),
+            ]
+            model_request = await self._build_model_request(messages)
+            model_output: ModelOutput = await self.llm_client.generate(model_request)
+            add_map = self._parse_add_value_fields(model_output.text)
+        except Exception as e:
+            logger.warning(f"Verify value fields failed, keep original fields: {e}")
+            return value_fields_map
+        if not add_map:
+            return value_fields_map
+        # 补充字段只接受真实存在的列名；与已选合并去重，每表最多 5 个
+        result = {k: list(v) for k, v in value_fields_map.items()}
+        for table_name, new_fields in add_map.items():
+            real_names = {
+                c.get("name") for c in columns_by_table.get(table_name, [])
+            }
+            merged = list(result.get(table_name, []))
+            for f in new_fields:
+                if f and f in real_names and f not in merged:
+                    merged.append(f)
+            result[table_name] = merged[:5]
+        return result
+
+    def _parse_add_value_fields(self, text: str) -> dict:
+        """解析补字段 JSON，返回 {表名: [补充字段, ...]}。"""
+        data = self._parse_json_strict(text)
+        add_map = data.get("add_fields") or {}
+        result = {}
+        for table, fields in add_map.items():
+            if not isinstance(fields, list):
+                continue
+            cleaned = [f for f in fields if isinstance(f, str) and f.strip()][:5]
+            if cleaned:
+                result[str(table)] = cleaned
+        return result
+
     # ---------------- 3.5 二次兜底：选表校验 + 补充缺失表 ----------------
     def _parse_verify_result(self, text: str) -> Tuple[bool, List[str]]:
         """解析校验结果 JSON，返回 (是否足够, 缺失表名列表)。"""
-        text = text.strip()
-        try:
-            data = json.loads(text)
-        except Exception:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                raise ValueError(f"Can not parse LLM output: {text}")
-            data = json.loads(text[start : end + 1])
+        data = self._parse_json_strict(text)
         sufficient = bool(data.get("sufficient", True))
         missing = []
         for item in data.get("missing_tables") or []:
@@ -648,10 +844,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         """
         if not table_names:
             return table_names
-        catalog_comments = {}
-        for item in catalog:
-            parts = item.split(" -- ", 1)
-            catalog_comments[parts[0]] = parts[1] if len(parts) > 1 else ""
+        catalog_comments = self._build_catalog_comments(catalog)
         schema_lines = []
         for t in table_names:
             cols = columns_by_table.get(t, [])
@@ -663,7 +856,6 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 selected_tables="\n".join(schema_lines),
                 table_catalog="\n".join(f"- {c}" for c in catalog),
             )
-            # logger.info(f"Verify tables prompt:\n{prompt}")
             messages = [
                 ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
                 ModelMessage(
@@ -686,9 +878,6 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             result.append(name)
             if len(result) >= self._max_selected_tables:
                 break
-        added = [t for t in result if t not in table_names]
-        # if added:
-        #     logger.info(f"Verify tables: supplement missing tables {added}")
         return result
 
     # ---------------- 追问补全：结合历史对话，把指代问题改写为自包含完整问题 ----------------
@@ -707,6 +896,30 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         return content[q_idx + len(_SCHEMA_LINKING_QUESTION_MARKER) :].strip()
 
     @staticmethod
+    def _extract_conclusion_text(content: str) -> str:
+        """从回复内容提取最终结论文本。
+
+        DataScientist 的回复 content 可能是 chart_action 的 action_report JSON
+        （含 display_type/sql/thought），此时只保留 thought 摘要：sql 会污染
+        下一轮的改写判断（可能照抄旧 SQL）且浪费 token，display_type 对理解
+        口径无帮助。非 JSON 的普通文本（如校验失败反馈）原样返回。
+        """
+        if not content:
+            return ""
+        text = content.strip()
+        try:
+            obj = json.loads(text)
+        except Exception:
+            return text
+        if isinstance(obj, dict):
+            thought = obj.get("thought")
+            if isinstance(thought, str) and thought.strip():
+                return thought.strip()
+            # 纯 action_report 结构（无 thought 摘要）不保留，避免带出 sql 噪音
+            return ""
+        return text
+
+    @staticmethod
     def _format_history_item(role_label: str, content: str) -> str:
         """格式化一条历史消息：去掉注入文本、压缩空白、超长截断。"""
         content = HOSchemaLinkingRetrieverOperator._strip_schema_linking_text(content)
@@ -720,12 +933,19 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
     async def _build_history_text_from_db(
         self, input_value: AgentGenerateContext
     ) -> str:
-        """从数据库 gpts_message 表读取同一会话的最近消息（与 Agent 记忆同源）。
+        """从数据库 gpts_message 表读取同一会话的最近几轮（与 Agent 记忆同源）。
 
-        注意：每一轮对话的 agent_conv_id 会带递增后缀（如 abc_1、abc_2），
-        而语义层执行时当前轮消息尚未入库，所以必须像 Agent 历史恢复那样
-        用真实 conv_id 做 LIKE 匹配（get_by_agent），而不是 get_by_conv_id 精确匹配。
-        取最近几轮拼成摘要；查询失败时静默返回空，由上层回退到原问题。
+        每轮只取头尾，中间全部丢弃：
+          - 头 = 该轮第一条 Human 发送的消息（用户问题，必留）
+          - 尾 = 该轮最后一条非 Human 发送的消息（最终回复，按自增 id 定位）
+        is_success 判成败：尾消息 is_success=1 才附结论；is_success=0 只留用户问题。
+        重试过程中的纠错反馈、未过校验的中间回复等一律不进历史。
+
+        分轮方式：每一轮对话的 agent_conv_id 带递增后缀（如 abc_1、abc_2），
+        语义层执行时当前轮消息尚未入库，所以用真实 conv_id 做 LIKE 匹配
+        （get_by_agent）捞取整段会话，再按完整 conv_id 分组即得每一轮；
+        DAO 已按自增 id 升序返回（id 是真实写入顺序，rounds 每轮从 0 重计且
+        重试会回跳，不能用于排序）。查询失败时静默返回空，由上层回退原问题。
         """
         try:
             agent_context = getattr(input_value, "agent_context", None)
@@ -733,34 +953,51 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             if not conv_id:
                 return ""
             from dbgpt.agent.util.conv_utils import parse_conv_id
-            from dbgpt_serve.agent.agents.db_gpts_memory import (
-                MetaDbGptsMessageMemory,
-            )
+            from dbgpt_serve.agent.db.gpts_messages_db import GptsMessagesDao
 
             real_conv_id, _ = parse_conv_id(conv_id)
             # 标准 DB-GPT 对话中，UserProxyAgent 的 role 为 "Human"，
-            # 会话内每条消息的 sender 或 receiver 必有一方是 "Human"，故一次查询即可覆盖整段对话
-            message_memory = MetaDbGptsMessageMemory()
-            messages = await self.blocking_func_to_async(
-                message_memory.get_by_agent, real_conv_id, _REWRITE_HISTORY_ROLE
+            # 会话内每条消息的 sender 或 receiver 必有一方是 "Human"，一次查询即可覆盖整段对话
+            message_dao = GptsMessagesDao()
+            results = await self.blocking_func_to_async(
+                message_dao.get_by_agent, real_conv_id, _REWRITE_HISTORY_ROLE
             )
-            if not messages:
+            if not results:
                 return ""
-            # DAO get_by_agent 已按 (conv_id 后缀, rounds) 排好序（即会话顺序），
-            # 不要用 rounds 重排：rounds 在每一轮（每个 conv_id）内都会从 0 重新计数，
-            # 按 (rounds, created_at) 重排会把多轮消息的顺序打乱（如 q1,q2,a1,a2）
+            # 按完整 conv_id（含后缀）分轮
+            groups: dict = {}
+            for m in results:
+                groups.setdefault(m.conv_id, []).append(m)
+            # 按每轮最大 id 升序排列轮次（id 是真实写入顺序），取最近几轮
+            round_list = sorted(groups.values(), key=lambda ms: max(x.id for x in ms))
             history = []
-            for m in messages[-_REWRITE_HISTORY_MAX_MESSAGES:]:
-                content = (getattr(m, "content", None) or "").strip()
-                if not content:
-                    continue
-                role = (getattr(m, "role", None) or "").lower()
-                label = "用户" if role in ("human", "user") else "助手"
-                line = HOSchemaLinkingRetrieverOperator._format_history_item(
-                    label, content
+            for ms in round_list[-_REWRITE_HISTORY_MAX_ROUNDS:]:
+                # 头：该轮第一条 Human 发送的消息（用户问题，必留）
+                head = next(
+                    (x for x in ms if (x.sender or "") == _REWRITE_HISTORY_ROLE),
+                    None,
                 )
-                if line:
-                    history.append(line)
+                if head is None:
+                    continue
+                head_text = self._format_history_item("用户", head.content)
+                if head_text:
+                    history.append(head_text)
+                # 尾：该轮 id 最大的非 Human 消息（最终回复）
+                tail = next(
+                    (
+                        x
+                        for x in reversed(ms)
+                        if (x.sender or "") != _REWRITE_HISTORY_ROLE
+                    ),
+                    None,
+                )
+                # 判定轮次成败：尾消息 is_success=1 才附最终结论，否则只留用户问题
+                if tail is not None and getattr(tail, "is_success", False):
+                    # content 若是 action_report JSON，只提取 thought 摘要，避免带出 sql
+                    tail_content = self._extract_conclusion_text(tail.content)
+                    tail_text = self._format_history_item("助手", tail_content)
+                    if tail_text:
+                        history.append(tail_text)
             return "\n".join(history)
         except Exception as e:
             logger.warning(f"Build history from db failed, skip: {e}")
@@ -768,15 +1005,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
     def _parse_rewrite_result(self, text: str) -> Tuple[bool, str]:
         """解析改写结果 JSON，返回 (是否引用了前文, 改写后的问题)。"""
-        text = text.strip()
-        try:
-            data = json.loads(text)
-        except Exception:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                raise ValueError(f"Can not parse LLM output: {text}")
-            data = json.loads(text[start : end + 1])
+        data = self._parse_json_strict(text)
         related = bool(data.get("related", False))
         rewritten = str(data.get("rewritten_question") or "").strip()
         return related, rewritten
@@ -820,7 +1049,6 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             or rewritten == question
         ):
             return question
-        # logger.info(f"Rewrite followup question: {question} -> {rewritten}")
         return rewritten
 
     async def _enumerate_field_values(
@@ -914,13 +1142,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
         columns_by_table = {}
         for t in table_names:
-            try:
-                columns_by_table[t] = await self.blocking_func_to_async(
-                    connector.get_columns, t
-                )
-            except Exception as e:
-                logger.warning(f"Get columns of table {t} failed: {e}")
-                columns_by_table[t] = []
+            columns_by_table[t] = await self._get_columns_with_fallback(connector, t)
 
         # 3.5 二次兜底：校验已选表是否足以回答用户问题，不足则从目录补充缺失表
         # （例如"咖啡机Q1总销量"：销售表只有 category_id 外键、无品类名称字段，
@@ -936,22 +1158,22 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 {"table": t, "relation": "二次校验补充"} for t in added_tables
             )
             for t in added_tables:
-                try:
-                    columns_by_table[t] = await self.blocking_func_to_async(
-                        connector.get_columns, t
-                    )
-                except Exception as e:
-                    logger.warning(f"Get columns of table {t} failed: {e}")
-                    columns_by_table[t] = []
+                columns_by_table[t] = await self._get_columns_with_fallback(
+                    connector, t
+                )
 
         # 4. 字段确认：LLM 看到选中表完整字段后，指定需要参考真实取值的字段
         value_fields_map = await self._select_value_fields(question, columns_by_table)
+        # 只保留真实存在的列名，防止 LLM 编造字段污染值域枚举（如 SELECT *、拼错的列名）
+        value_fields_map = self._filter_value_fields(value_fields_map, columns_by_table)
+
+        # 4.5 二次兜底：查已选值域字段的真实取值，LLM 判断是否足够，不足则补字段
+        value_fields_map = await self._verify_and_fix_value_fields(
+            question, columns_by_table, value_fields_map
+        )
 
         # 5. 拼装表结构（含字段取值参考）
-        catalog_comments = {}
-        for item in catalog:
-            parts = item.split(" -- ", 1)
-            catalog_comments[parts[0]] = parts[1] if len(parts) > 1 else ""
+        catalog_comments = self._build_catalog_comments(catalog)
         schemas_text = await self._build_schemas_text(
             table_names, catalog_comments, columns_by_table, value_fields_map
         )
@@ -972,7 +1194,6 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             f"选中表的完整表结构（字段、类型、主键、注释）:\n{result['schemas_text']}\n\n"
             f"用户问题:\n{question}"
         )
-        # logger.info(f"Schema linking context:\n{context}")
         return HOContextBody(context_key=self._context_key, context=context)
 
 
@@ -1063,8 +1284,4 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             f"选中表的完整表结构（字段、类型、主键、注释）:\n{result['schemas_text']}\n\n"
             f"用户问题:\n{question}"
         )
-        # logger.info(
-        #     f"Agent schema linking injected for db {result['db_name']}:\n"
-        #     f"{input_value.message.content}"
-        # )
         return input_value
