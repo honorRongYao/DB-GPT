@@ -157,6 +157,27 @@ _DEFAULT_REWRITE_QUESTION_PROMPT = """你是一个对话理解助手。下面是
 {{"related": true 或 false, "rewritten_question": "改写后的完整问题（related 为 false 时与原问题相同）"}}
 """
 
+_DEFAULT_EXTRACT_KEYWORDS_PROMPT = """你是一个数据分析助手。请从用户问题中提取"关键实体词"，用于后续语义检索（向量匹配）和选表参考。
+
+提取规则：
+1. 只提取需要"去库里匹配真实取值"的实体词：品类名（咖啡机、空调、风扇）、品牌名（苏泊尔、美的）、评论打标词（异味、噪音大、好评）、地区（广东省、华东地区）、商品/标题实体（咖啡机pro版）等。
+2. 不提取：指标（销量、金额、评论数）、时间（2026年、Q1、上半年）、动作词（分析、对比、列出）、排序/占比修饰（前3、环比、占比）、虚词助词。
+3. 用户问题包含多个独立诉求时（如"分析评论，同时对比销量"），每个诉求里的关键实体词都要提取，不要遗漏。
+4. 同一个实体只保留一次，去重。
+5. 品牌名与品类名连用时（如"德龙咖啡机""美的空调"），拆成品牌名和品类名两个词分别提取，不要保留组合词。
+6. 不提取型号/版本后缀（如 pro、plus、max、2026款）；型号主体（如 AC-555）作为整体提取。
+7. 提取结果若存在包含关系（如"德龙咖啡机"包含"咖啡机"），只保留最小粒度的词。
+
+输出严格 JSON（只输出 JSON，不要任何解释文字）：
+{"关键词列表": ["咖啡机", "异味"]}
+
+示例1 输入：帮我分析2026年上半年咖啡机的异味问题
+输出：{"关键词列表": ["咖啡机", "异味"]}
+
+示例2 输入：分别统计广东省和华东地区电动风扇的销量
+输出：{"关键词列表": ["广东省", "华东地区", "电动风扇"]}
+"""
+
 # 追问补全相关常量：历史只取最近几轮（每轮只留头尾）、单条内容截断，避免上下文撑爆模型输入
 _REWRITE_HISTORY_MAX_ROUNDS = 5
 _REWRITE_HISTORY_MAX_CHARS = 200
@@ -513,8 +534,13 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         return columns
 
     # ---------------- 2. LLM 选表 + 关联 ----------------
-    async def _select_tables(self, question: str, catalog: List[str]) -> List[dict]:
-        """调用 LLM 从目录中选择相关表并判断关联关系。"""
+    async def _select_tables(
+        self, question: str, catalog: List[str], keywords_text: str = ""
+    ) -> List[dict]:
+        """调用 LLM 从目录中选择相关表并判断关联关系。
+
+        keywords_text: 从问题提取的关键实体词文本，附加到 user 消息辅助选表。
+        """
         catalog_str = "\n".join(
             f"{i + 1}. {item}" for i, item in enumerate(catalog)
         )
@@ -529,26 +555,26 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 f"Select table prompt template format failed ({e}), "
                 f"fallback to all tables"
             )
-            return [
-                {"table": t.split(" -- ", 1)[0], "relation": ""} for t in catalog
-            ]
+            return self._fallback_all_tables(catalog)
         try:
             # system 放角色/目录/要求，user 放用户问题（DB-GPT 枚举用 HUMAN 表示用户消息）
-            messages = [
-                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
-                ModelMessage(
-                    role=ModelMessageRoleType.HUMAN, content=f"用户问题：{question}"
-                ),
-            ]
-            model_request = await self._build_model_request(messages)
-            model_output: ModelOutput = await self.llm_client.generate(model_request)
-            return self._parse_table_selection(model_output.text)
+            user_content = f"用户问题：{question}"
+            if keywords_text:
+                user_content += (
+                    f"\n\n用户问题中的关键实体词（选表请覆盖这些实体所在的表）：\n{keywords_text}"
+                )
+            output = await self._llm_complete(prompt, user_content)
+            return self._parse_table_selection(output)
         except Exception as e:
             logger.warning(f"LLM select tables failed, fallback to all tables: {e}")
-            # 兜底：返回全部表（只取纯表名，不带注释串），保证不中断流程
-            return [
-                {"table": t.split(" -- ", 1)[0], "relation": ""} for t in catalog
-            ]
+            return self._fallback_all_tables(catalog)
+
+    @staticmethod
+    def _fallback_all_tables(catalog: List[str]) -> List[dict]:
+        """兜底：返回全部表（只取纯表名，不带注释串），保证不中断流程。"""
+        return [
+            {"table": t.split(" -- ", 1)[0], "relation": ""} for t in catalog
+        ]
 
     async def _build_model_request(self, messages: List[ModelMessage]) -> ModelRequest:
         models = await self.llm_client.models()
@@ -556,6 +582,16 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             raise ValueError("No models available.")
         model = self._model or models[0].model
         return ModelRequest.build_request(model, messages=messages)
+
+    async def _llm_complete(self, prompt: str, user_content: str) -> str:
+        """执行一次 LLM 补全（system=提示词, user=问题），返回输出文本。"""
+        messages = [
+            ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
+            ModelMessage(role=ModelMessageRoleType.HUMAN, content=user_content),
+        ]
+        model_request = await self._build_model_request(messages)
+        model_output: ModelOutput = await self.llm_client.generate(model_request)
+        return model_output.text
 
     def _parse_table_selection(self, text: str) -> List[dict]:
         """解析 LLM 输出的 JSON，提取选中的表及关联关系。"""
@@ -574,8 +610,21 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
     @staticmethod
     def _parse_json_strict(text: str) -> dict:
-        """容错解析 LLM 输出的 JSON：优先整体解析，失败则截取首个 { 到最后一个 } 再解析。"""
+        """容错解析 LLM 输出的 JSON：优先整体解析，失败则截取首个 { 到最后一个 } 再解析。
+
+        兼容 LLM 常见输出问题：中文引号“”、中文冒号：等。
+        """
         text = text.strip()
+        text = (
+            text.replace("“", '"')
+            .replace("”", '"')
+            .replace("‘", "'")
+            .replace("’", "'")
+            .replace("：", ":")
+        )
+        # 兼容 LLM 把提示词示例的双花括号照抄进输出（{{ } } 成对出现时才还原）
+        if "{{" in text:
+            text = text.replace("{{", "{").replace("}}", "}")
         try:
             return json.loads(text)
         except Exception:
@@ -607,6 +656,19 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 return comment.split(sep, 1)[0].strip()
         return comment
 
+    @staticmethod
+    def _format_columns(columns: List[dict], with_pk: bool = False) -> List[str]:
+        """把字段列表格式化为 "    字段 类型 [PK] -- 注释" 行。"""
+        lines = []
+        for col in columns:
+            name = col.get("name", "")
+            col_type = col.get("type", "")
+            pk = " [PK]" if with_pk and col.get("is_in_primary_key") else ""
+            comment = str(col.get("comment") or "").strip()
+            suffix = f" -- {comment}" if comment else ""
+            lines.append(f"    {name} {col_type}{pk}{suffix}")
+        return lines
+
     async def _build_schemas_text(
         self,
         table_names: List[str],
@@ -623,16 +685,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         schemas = []
         for table_name in table_names:
             columns = columns_by_table.get(table_name, [])
-            col_lines = []
-            for col in columns:
-                name = col.get("name", "")
-                col_type = col.get("type", "")
-                pk = " [PK]" if col.get("is_in_primary_key") else ""
-                comment = str(col.get("comment") or "").strip()
-                if comment:
-                    col_lines.append(f"    {name} {col_type}{pk} -- {comment}")
-                else:
-                    col_lines.append(f"    {name} {col_type}{pk}")
+            col_lines = self._format_columns(columns, with_pk=True)
             table_comment = catalog_comments.get(table_name, "")
             display_comment = self._extract_business_comment(table_comment)
             if display_comment:
@@ -683,15 +736,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         for table_name, columns in columns_by_table.items():
             if not columns:
                 continue
-            col_lines = []
-            for col in columns:
-                name = col.get("name", "")
-                col_type = col.get("type", "")
-                comment = str(col.get("comment") or "").strip()
-                if comment:
-                    col_lines.append(f"    {name} {col_type} -- {comment}")
-                else:
-                    col_lines.append(f"    {name} {col_type}")
+            col_lines = self._format_columns(columns)
             schema_lines.append(f"{table_name}(\n" + "\n".join(col_lines) + "\n)")
         if not schema_lines:
             return {}
@@ -699,25 +744,18 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             prompt = _DEFAULT_SELECT_VALUE_FIELDS_PROMPT.format(
                 schemas="\n\n".join(schema_lines)
             )
-            messages = [
-                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
-                ModelMessage(
-                    role=ModelMessageRoleType.HUMAN, content=f"用户问题：{question}"
-                ),
-            ]
-            model_request = await self._build_model_request(messages)
-            model_output: ModelOutput = await self.llm_client.generate(model_request)
-            return self._parse_value_fields(model_output.text)
+            output = await self._llm_complete(prompt, f"用户问题：{question}")
+            return self._parse_fields_map(output, "value_fields")
         except Exception as e:
             logger.warning(f"LLM select value fields failed, skip: {e}")
             return {}
 
-    def _parse_value_fields(self, text: str) -> dict:
-        """解析 LLM 输出的 value_fields JSON，返回 {表名: [字段, ...]}。"""
-        data = self._parse_json_strict(text)
-        vf_map = data.get("value_fields") or {}
+    @staticmethod
+    def _parse_fields_map(text: str, key: str) -> dict:
+        """解析 {key: {表名: [字段]}} 形式的 JSON，过滤非列表/空字段，每表最多 5 个。"""
+        data = HOSchemaLinkingRetrieverOperator._parse_json_strict(text)
         result = {}
-        for table, fields in vf_map.items():
+        for table, fields in (data.get(key) or {}).items():
             if not isinstance(fields, list):
                 continue
             cleaned = [f for f in fields if isinstance(f, str) and f.strip()][:5]
@@ -776,16 +814,8 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 field_values="\n\n".join(field_lines),
                 question=question,
             )
-            messages = [
-                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
-                ModelMessage(
-                    role=ModelMessageRoleType.HUMAN,
-                    content=f"用户问题：{question}",
-                ),
-            ]
-            model_request = await self._build_model_request(messages)
-            model_output: ModelOutput = await self.llm_client.generate(model_request)
-            add_map = self._parse_add_value_fields(model_output.text)
+            output = await self._llm_complete(prompt, f"用户问题：{question}")
+            add_map = self._parse_fields_map(output, "add_fields")
         except Exception as e:
             logger.warning(f"Verify value fields failed, keep original fields: {e}")
             return value_fields_map
@@ -802,19 +832,6 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 if f and f in real_names and f not in merged:
                     merged.append(f)
             result[table_name] = merged[:5]
-        return result
-
-    def _parse_add_value_fields(self, text: str) -> dict:
-        """解析补字段 JSON，返回 {表名: [补充字段, ...]}。"""
-        data = self._parse_json_strict(text)
-        add_map = data.get("add_fields") or {}
-        result = {}
-        for table, fields in add_map.items():
-            if not isinstance(fields, list):
-                continue
-            cleaned = [f for f in fields if isinstance(f, str) and f.strip()][:5]
-            if cleaned:
-                result[str(table)] = cleaned
         return result
 
     # ---------------- 3.5 二次兜底：选表校验 + 补充缺失表 ----------------
@@ -856,15 +873,8 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 selected_tables="\n".join(schema_lines),
                 table_catalog="\n".join(f"- {c}" for c in catalog),
             )
-            messages = [
-                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
-                ModelMessage(
-                    role=ModelMessageRoleType.HUMAN, content=f"用户问题：{question}"
-                ),
-            ]
-            model_request = await self._build_model_request(messages)
-            model_output: ModelOutput = await self.llm_client.generate(model_request)
-            sufficient, missing = self._parse_verify_result(model_output.text)
+            output = await self._llm_complete(prompt, f"用户问题：{question}")
+            sufficient, missing = self._parse_verify_result(output)
         except Exception as e:
             logger.warning(f"LLM verify tables failed, keep original selection: {e}")
             return table_names
@@ -1010,6 +1020,40 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         rewritten = str(data.get("rewritten_question") or "").strip()
         return related, rewritten
 
+    @staticmethod
+    def _parse_keywords_result(text: str) -> List[str]:
+        """容错解析关键词提取结果，返回去重后的实体词列表。"""
+        try:
+            data = HOSchemaLinkingRetrieverOperator._parse_json_strict(text)
+            kws = data.get("关键词列表")
+        except Exception:
+            kws = None
+        if not isinstance(kws, list):
+            return []
+        seen, out = set(), []
+        for k in kws:
+            s = str(k or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    async def _extract_keywords(self, question: str) -> List[str]:
+        """关键词提取：从改写后的完整问题中提取需要语义检索/选表参考的实体词。
+
+        只输出实体词列表（不判断目标字段）；后续可把结果交给向量检索方
+        （返回 {向量子查询, 目标字段} 拼进分析 SQL）。失败或为空时返回
+        空列表，不阻塞主流程。
+        """
+        try:
+            output = await self._llm_complete(
+                _DEFAULT_EXTRACT_KEYWORDS_PROMPT, f"用户问题：{question}"
+            )
+            return self._parse_keywords_result(output)
+        except Exception as e:
+            logger.warning(f"Extract keywords failed, use empty list: {e}")
+            return []
+
     async def _rewrite_followup_question(
         self, question: str, input_value: AgentGenerateContext
     ) -> str:
@@ -1027,16 +1071,10 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             return question
         try:
             prompt = _DEFAULT_REWRITE_QUESTION_PROMPT.format(history=history)
-            messages = [
-                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
-                ModelMessage(
-                    role=ModelMessageRoleType.HUMAN,
-                    content=f"当前用户问题：{question}",
-                ),
-            ]
-            model_request = await self._build_model_request(messages)
-            model_output: ModelOutput = await self.llm_client.generate(model_request)
-            related, rewritten = self._parse_rewrite_result(model_output.text)
+            output = await self._llm_complete(
+                prompt, f"当前用户问题：{question}"
+            )
+            related, rewritten = self._parse_rewrite_result(output)
         except Exception as e:
             logger.warning(
                 f"Rewrite followup question failed, keep original question: {e}"
@@ -1101,10 +1139,13 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         return result
 
     # ---------------- 主流程 ----------------
-    async def _run_schema_linking(self, question: str) -> dict:
+    async def _run_schema_linking(
+        self, question: str, keywords_text: str = ""
+    ) -> dict:
         """执行语义层流程（目录 -> 选表+关联 -> 加载字段 -> 字段确认 -> 全字段+值域枚举）。
 
         供普通检索算子（map）与 Agent 版算子（map）共用。
+        keywords_text: 从问题提取的关键实体词文本，附加给选表 LLM 参考。
         """
         db_name = self._datasource._db_name
         dialect = self._datasource.dialect
@@ -1113,7 +1154,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         catalog = await self._build_table_catalog()
 
         # 2. LLM 选表 + 关联关系
-        selected = await self._select_tables(question, catalog)
+        selected = await self._select_tables(question, catalog, keywords_text)
         if selected:
             selected_text = "\n".join(
                 f"- {s['table']}"
@@ -1271,7 +1312,12 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         # 追问补全：结合历史对话，把"那环比是多少了"这类指代问题改写为
         # "咖啡机Q1销量环比上季度"的完整问题，避免漏选品类表、口径错乱
         question = await self._rewrite_followup_question(question, input_value)
-        result = await self._run_schema_linking(question)
+        # 关键词提取：从改写后的完整问题中提取实体取值词（辅助选表覆盖实体所在表；
+        # 后续可把关键词列表交给向量检索方，返回 {向量子查询, 目标字段} 拼进分析 SQL）
+        keywords = await self._extract_keywords(question)
+        keywords_text = "、".join(keywords) if keywords else ""
+        logger.info(f"schema_linking extracted keywords: {keywords}")
+        result = await self._run_schema_linking(question, keywords_text=keywords_text)
         # 把语义层选好的表结构与用户问题一起作为 user 消息，约束 Agent 只使用这些表
         input_value.message.content = (
             "以下数据表已由语义层根据你的问题选好（含表间关联关系与完整表结构），"
