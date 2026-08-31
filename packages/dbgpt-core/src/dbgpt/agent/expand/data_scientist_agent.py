@@ -60,10 +60,17 @@ class DataScientistAgent(ConversableAgent):
                 "It is prohibited to construct data yourself as query conditions. "
                 "Only the data values given by the famous songs in the input can "
                 "be used as query conditions.",
-                "Please select an appropriate one from the supported display methods "
-                "for data display. If no suitable display type is found, "
-                "use 'response_table' as default value. Supported display types: \n"
-                "{{ display_type }}",
+                "Please select the most suitable display method based on the user's "
+                "question and the characteristics of the data. Prefer charts over "
+                "tables: time trend data -> response_line_chart, proportion or "
+                "distribution -> response_pie_chart or response_donut_chart, variable "
+                "relationship -> response_scatter_chart or response_bubble_chart, "
+                "multi-group comparison -> response_bar_chart or response_area_chart. "
+                "Only use 'response_table' when the data is not suitable for any chart "
+                "(e.g. too many columns or non-numeric columns). And always write a "
+                "real data analysis conclusion in the 'thought' field, such as trends, "
+                "proportions, comparisons, anomalies or recommendations. Supported "
+                "display types: \n{{ display_type }}",
             ],
             category="agent",
             key="dbgpt_agent_expand_dashboard_assistant_agent_profile_constraints",
