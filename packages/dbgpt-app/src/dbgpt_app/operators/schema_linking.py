@@ -41,6 +41,7 @@ from dbgpt.core.awel.flow import (
 from dbgpt.model.operators import MixinLLMOperator
 from dbgpt.util.i18n_utils import _
 
+from .category_recall import DEFAULT_MAX_DISTANCE, recall_many
 from .llm import HOContextBody
 
 logger = logging.getLogger(__name__)
@@ -1140,12 +1141,16 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
     # ---------------- 主流程 ----------------
     async def _run_schema_linking(
-        self, question: str, keywords_text: str = ""
+        self,
+        question: str,
+        keywords_text: str = "",
+        recalled_table_names: Optional[List[str]] = None,
     ) -> dict:
         """执行语义层流程（目录 -> 选表+关联 -> 加载字段 -> 字段确认 -> 全字段+值域枚举）。
 
         供普通检索算子（map）与 Agent 版算子（map）共用。
         keywords_text: 从问题提取的关键实体词文本，附加给选表 LLM 参考。
+        recalled_table_names: 从召回 SQL 注释中识别的来源表，加入允许表集合。
         """
         db_name = self._datasource._db_name
         dialect = self._datasource.dialect
@@ -1153,8 +1158,16 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         # 1. 全量轻目录（表名 + 注释，注释含业务语义与关联关系）
         catalog = await self._build_table_catalog()
 
-        # 2. LLM 选表 + 关联关系
+        # 2. LLM 选表 + 关联关系，并合并向量召回 SQL 注释中的来源表。
         selected = await self._select_tables(question, catalog, keywords_text)
+        catalog_tables = {item.split(" -- ")[0] for item in catalog}
+        selected_names = {item["table"] for item in selected}
+        for table_name in recalled_table_names or []:
+            if table_name in catalog_tables and table_name not in selected_names:
+                selected.append(
+                    {"table": table_name, "relation": "向量召回命中的来源表"}
+                )
+                selected_names.add(table_name)
         if selected:
             selected_text = "\n".join(
                 f"- {s['table']}"
@@ -1166,7 +1179,6 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
         # 3. 过滤选中表（防止 LLM 编造表名）并加载完整字段
         connector = self._datasource.connector
-        catalog_tables = {item.split(" -- ")[0] for item in catalog}
         seen = set()
         table_names = []
         for item in selected:
@@ -1175,8 +1187,6 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 continue
             seen.add(name)
             table_names.append(name)
-            if len(table_names) >= self._max_selected_tables:
-                break
         if not table_names:
             logger.warning("No valid selected tables, fallback to all tables")
             table_names = list(catalog_tables)[: self._max_selected_tables]
@@ -1223,6 +1233,9 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             "dialect": dialect,
             "selected_text": selected_text,
             "schemas_text": schemas_text,
+            "table_names": table_names,
+            "columns_by_table": columns_by_table,
+            "value_fields_map": value_fields_map,
         }
 
     async def map(self, question: str) -> HOContextBody:
@@ -1304,6 +1317,68 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         tags={"order": TAGS_ORDER_HIGH},
     )
 
+    async def _split_keywords_for_vector_recall(
+        self,
+        keywords: List[str],
+        table_names: List[str],
+        columns_by_table: dict,
+        value_fields_map: dict,
+    ) -> Tuple[List[str], List[str]]:
+        """在 Schema Linking 选中的原始业务表中模糊匹配关键词。"""
+        connector = self._datasource.connector
+        searchable_fields = {}
+        for table_name in table_names:
+            fields = value_fields_map.get(table_name) or [
+                column.get("name")
+                for column in columns_by_table.get(table_name, [])
+                if any(
+                    marker in str(column.get("name") or "").lower()
+                    for marker in (
+                        "category",
+                        "product",
+                        "brand",
+                        "type",
+                        "name",
+                        "model",
+                    )
+                )
+            ]
+            searchable_fields[table_name] = [field for field in fields if field]
+
+        matched, unmatched = [], []
+        for keyword in keywords:
+            keyword_matched = False
+            escaped_keyword = (
+                keyword.replace("\\", "\\\\")
+                .replace("'", "''")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            for table_name, fields in searchable_fields.items():
+                if not fields:
+                    continue
+                conditions = " OR ".join(
+                    f"CAST(`{field.replace('`', '``')}` AS STRING) "
+                    f"LIKE '%{escaped_keyword}%' ESCAPE '\\\\'"
+                    for field in fields
+                )
+                sql = (
+                    f"SELECT 1 FROM `{table_name.replace('`', '``')}` "
+                    f"WHERE {conditions} LIMIT 1"
+                )
+                try:
+                    rows = await self.blocking_func_to_async(connector.run, sql)
+                    # connector.run() 会把列名作为第 1 行插入；至少第 2 行才是真实命中。
+                    if rows and len(rows) > 1:
+                        keyword_matched = True
+                        break
+                except Exception as e:
+                    logger.warning(
+                        "LIKE check failed for %s.%s: %s", table_name, fields, e
+                    )
+            (matched if keyword_matched else unmatched).append(keyword)
+        return matched, unmatched
+
     async def map(self, input_value: AgentGenerateContext) -> AgentGenerateContext:
         """执行语义层并把选表结果注入用户消息，然后原样透传。"""
         if not input_value.message:
@@ -1312,22 +1387,86 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         # 追问补全：结合历史对话，把"那环比是多少了"这类指代问题改写为
         # "咖啡机Q1销量环比上季度"的完整问题，避免漏选品类表、口径错乱
         question = await self._rewrite_followup_question(question, input_value)
-        # 关键词提取：从改写后的完整问题中提取实体取值词（辅助选表覆盖实体所在表；
-        # 后续可把关键词列表交给向量检索方，返回 {向量子查询, 目标字段} 拼进分析 SQL）
+        # 关键词提取后执行向量召回；召回模块只返回带来源注释的 SQL。
         keywords = await self._extract_keywords(question)
         keywords_text = "、".join(keywords) if keywords else ""
         logger.info(f"schema_linking extracted keywords: {keywords}")
-        result = await self._run_schema_linking(question, keywords_text=keywords_text)
-        # 把语义层选好的表结构与用户问题一起作为 user 消息，约束 Agent 只使用这些表
+
+        # 先保持原 Schema Linking 流程完成选表，再查询这些原始业务表的真实字段。
+        result = await self._run_schema_linking(
+            question,
+            keywords_text=keywords_text,
+        )
+
+        recall_sql_list = []
+        matched_keywords, recall_keywords = [], []
+        if keywords:
+            try:
+                matched_keywords, recall_keywords = (
+                    await self._split_keywords_for_vector_recall(
+                        keywords,
+                        result["table_names"],
+                        result["columns_by_table"],
+                        result["value_fields_map"],
+                    )
+                )
+                logger.info(
+                    "schema_linking source-table LIKE matched keywords: %s, "
+                    "vector recall keywords: %s",
+                    matched_keywords,
+                    recall_keywords,
+                )
+                if recall_keywords:
+                    recall_results = await self.blocking_func_to_async(
+                        recall_many, recall_keywords, DEFAULT_MAX_DISTANCE
+                    )
+                    for recall_result in recall_results:
+                        recall_sql_list.extend(recall_result.get("sql", []))
+            except Exception as e:
+                logger.warning(f"Keyword LIKE check or vector recall failed, skip: {e}")
+
+        # SQL 首行注释格式为“# 关键词:... 来自表 ...，主键 ...”，从中提取来源表。
+        recalled_tables = []
+        for recall_sql in recall_sql_list:
+            match = re.search(r"来自表\s+([^，\s]+)", recall_sql)
+            if match and match.group(1) not in recalled_tables:
+                recalled_tables.append(match.group(1))
+
+        # 召回命中了原选表之外的表时，重新构建最终允许表集合和完整结构。
+        if recalled_tables:
+            result = await self._run_schema_linking(
+                question,
+                keywords_text=keywords_text,
+                recalled_table_names=recalled_tables,
+            )
+        keyword_filter_context = ""
+        if matched_keywords:
+            keyword_filter_context += (
+                "\n\n可直接使用数据库普通模糊匹配的关键词：\n"
+                + "、".join(matched_keywords)
+                + "\n这些关键词无需向量召回。请由 DataScientist 根据允许表的字段语义，"
+                "在最终分析 SQL 中使用 LIKE '%关键词%' 生成合适的过滤条件。"
+            )
+        if recall_sql_list:
+            keyword_filter_context += (
+                "\n\n无法通过普通模糊匹配直接命中的关键词，需要使用以下向量召回 SQL。"
+                "每条 SQL 开头的 # 注释也属于提示信息：\n"
+                + "\n\n".join(recall_sql_list)
+            )
+
+        # 允许表 = Schema Linking 选中的表 + 召回 SQL 注释中的来源表。
         input_value.message.content = (
-            "以下数据表已由语义层根据你的问题选好（含表间关联关系与完整表结构），"
-            "请严格使用这些表生成 SQL 进行数据分析，禁止使用除此之外的任何表，"
-            "禁止编造字段名，禁止添加库名前缀。"
-            "必须完整实现用户问题的所有量化要求：例如 TOP3/前N/排名必须用窗口函数"
-            "或 LIMIT 取前N，枚举类过滤值不确定时用 LIKE 模糊匹配，聚合、分组、排序"
-            "与问题口径一致；生成 SQL 后逐项自查是否满足。\n\n"
-            f"根据用户问题选择的表及表间关联关系:\n{result['selected_text']}\n\n"
-            f"选中表的完整表结构（字段、类型、主键、注释）:\n{result['schemas_text']}\n\n"
+            "以下数据表由语义层选表和向量召回共同确定（含表间关联关系与完整表结构），"
+            "请严格使用下面列出的表生成 SQL 进行数据分析，禁止使用除此之外的任何表，"
+            "禁止编造字段名，禁止添加库名前缀。普通模糊匹配与向量召回仅用于帮助你"
+            "构造最终过滤条件，最终业务分析 SQL 仍由你生成。向量召回 SQL 用于定位"
+            "实体真实值和主键，请将其作为最终分析 SQL 的子查询或过滤依据，不要直接"
+            "返回召回 SQL。必须完整实现用户问题的所有量化要求：例如 TOP3/前N/排名"
+            "必须用窗口函数或 LIMIT 取前N，聚合、分组、排序与问题口径一致；"
+            "生成 SQL 后逐项自查。\n\n"
+            f"允许使用的表及表间关联关系:\n{result['selected_text']}\n\n"
+            f"允许使用表的完整表结构（字段、类型、主键、注释）:\n{result['schemas_text']}"
+            f"{keyword_filter_context}\n\n"
             f"用户问题:\n{question}"
         )
         return input_value

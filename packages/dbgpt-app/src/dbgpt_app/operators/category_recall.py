@@ -9,7 +9,7 @@ import pymysql
 DORIS_HOST = os.getenv("DORIS_HOST", "10.233.3.31")
 DORIS_PORT = int(os.getenv("DORIS_PORT", "9030"))
 DORIS_USER = os.getenv("DORIS_USER", "root")
-DORIS_PASSWORD = os.getenv("DORIS_PASSWORD", "")
+DORIS_PASSWORD = "dsdHHSA34."
 DATABASE = "voc_ai_test"
 TARGET_TABLE = "category_embedding"
 EMBEDDING_FUNCTION = "voc.bge_embed"
