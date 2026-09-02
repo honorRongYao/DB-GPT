@@ -19,13 +19,26 @@ class SqlInput(BaseModel):
 
     display_type: str = Field(
         ...,
-        description="The chart rendering method selected for SQL. If you don’t know "
-        "what to output, just output 'response_table' uniformly.",
+        description="The chart rendering method selected for SQL. You MUST choose the "
+        "most suitable chart type based on the user's question and the characteristics "
+        "of the query result data. For example: time trend data -> response_line_chart, "
+        "proportion or distribution -> response_pie_chart or response_donut_chart, "
+        "relationship between variables -> response_scatter_chart or "
+        "response_bubble_chart, multi-group comparison -> response_bar_chart or "
+        "response_area_chart, dense numeric distribution -> response_heatmap. "
+        "Only when the data is not suitable for any chart (e.g. too many columns or "
+        "non-numeric columns) use 'response_table'. Never default to 'response_table'.",
     )
     sql: str = Field(
         ..., description="Executable sql generated for the current target/problem"
     )
-    thought: str = Field(..., description="Summary of thoughts to the user")
+    thought: str = Field(
+        ...,
+        description="Data analysis conclusion for the user based on the SQL execution "
+        "result. It MUST contain real analysis content such as trends, proportions, "
+        "comparisons, anomalies or recommendations. Do not just say 'the SQL has been "
+        "generated' or restate the user's question.",
+    )
 
 
 class ChartAction(Action[SqlInput]):

@@ -5,6 +5,7 @@ import Icon, {
   ClockCircleOutlined,
   ConsoleSqlOutlined,
   ForkOutlined,
+  MessageOutlined,
   PartitionOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
@@ -79,12 +80,12 @@ function ConstructLayout({ children, className }: { children: React.ReactNode; c
       icon: <ClockCircleOutlined />,
       path: '/scheduled-tasks',
     },
-    // {
-    //   key: 'prompt',
-    //   name: t('Prompt'),
-    //   icon: <MessageOutlined />,
-    //   path: '/prompt',
-    // },
+    {
+      key: 'prompt',
+      name: t('Prompt'),
+      icon: <MessageOutlined />,
+      path: '/prompt',
+    },
     // {
     //   key: 'dbgpts',
     //   name: t('dbgpts_community'),

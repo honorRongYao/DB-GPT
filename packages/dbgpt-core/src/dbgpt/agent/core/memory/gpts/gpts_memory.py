@@ -95,6 +95,10 @@ class GptsMemory:
     async def push_message(self, conv_id: str, temp_msg: Optional[str] = None):
         """Push conversation message."""
         queue = self.queue(conv_id)
+        if not queue:
+            # 客户端已断连时，memory.clear() 已删除该 conv 的队列，跳过推送即可
+            logger.warning(f"push_message skip, queue not found for conv_id: {conv_id}")
+            return
         enable_vis_tag = self.enable_vis_message(conv_id=conv_id)
         if enable_vis_tag:
             # 如果有临时消息内容需要push 拼接再最末尾，否则直接从短期记忆中发布最后消息
@@ -116,6 +120,10 @@ class GptsMemory:
     async def complete(self, conv_id: str):
         """Complete conversation message."""
         queue = self.queue(conv_id)
+        if not queue:
+            # 客户端已断连时，memory.clear() 已删除该 conv 的队列，无需通知前端
+            logger.warning(f"complete skip, queue not found for conv_id: {conv_id}")
+            return
 
         await queue.put("[DONE]")
 

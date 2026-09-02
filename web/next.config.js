@@ -3,11 +3,16 @@ const CopyPlugin = require("copy-webpack-plugin");
 const MonacoWebpackPlugin = require("monaco-editor-webpack-plugin");
 const path = require("path");
 const nextConfig = {
+  staticPageGenerationTimeout: 600,
   experimental: {
     esmExternals: "loose",
   },
   typescript: {
     ignoreBuildErrors: true,
+  },
+  eslint: {
+    // Windows 检出为 CRLF 行尾，prettier 规则校验 CR 会中断构建，构建时跳过 lint
+    ignoreDuringBuilds: true,
   },
   env: {
     API_BASE_URL: process.env.API_BASE_URL,

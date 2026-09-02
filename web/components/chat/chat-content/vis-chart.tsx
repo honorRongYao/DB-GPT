@@ -16,7 +16,7 @@ function VisChart({ data }: Props) {
   if (!data) {
     return null;
   }
-  return <ChartView data={data?.data} type={data?.type} sql={data?.sql} />;
+  return <ChartView data={data?.data} type={data?.type} sql={data?.sql} describe={data?.describe} />;
 }
 
 export default VisChart;
