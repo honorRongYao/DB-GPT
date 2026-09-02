@@ -18,7 +18,7 @@
 import json
 import logging
 import re
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from dbgpt.agent import AgentGenerateContext
 from dbgpt.agent.resource.database import DBResource
@@ -41,7 +41,7 @@ from dbgpt.core.awel.flow import (
 from dbgpt.model.operators import MixinLLMOperator
 from dbgpt.util.i18n_utils import _
 
-from .category_recall import DEFAULT_MAX_DISTANCE, recall_many
+from .category_recall import DEFAULT_MAX_DISTANCE, TARGET_TABLE, recall_many
 from .llm import HOContextBody
 
 logger = logging.getLogger(__name__)
@@ -1164,9 +1164,12 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         selected_names = {item["table"] for item in selected}
         for table_name in recalled_table_names or []:
             if table_name in catalog_tables and table_name not in selected_names:
-                selected.append(
-                    {"table": table_name, "relation": "向量召回命中的来源表"}
+                relation = (
+                    "向量实体定位表；通过 table_name、column_name 和 raw_data 标识并关联来源业务表"
+                    if table_name == TARGET_TABLE
+                    else "向量召回命中的来源业务表"
                 )
+                selected.append({"table": table_name, "relation": relation})
                 selected_names.add(table_name)
         if selected:
             selected_text = "\n".join(
@@ -1323,61 +1326,86 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         table_names: List[str],
         columns_by_table: dict,
         value_fields_map: dict,
-    ) -> Tuple[List[str], List[str]]:
-        """在 Schema Linking 选中的原始业务表中模糊匹配关键词。"""
+    ) -> Tuple[Dict[str, List[dict]], List[str]]:
+        """在选中的原始业务表中模糊匹配关键词，并返回命中的表、字段和值。"""
         connector = self._datasource.connector
         searchable_fields = {}
         for table_name in table_names:
-            fields = value_fields_map.get(table_name) or [
-                column.get("name")
-                for column in columns_by_table.get(table_name, [])
-                if any(
-                    marker in str(column.get("name") or "").lower()
-                    for marker in (
-                        "category",
-                        "product",
-                        "brand",
-                        "type",
-                        "name",
-                        "model",
+            if table_name == "dim_product_category":
+                real_fields = {
+                    column.get("name")
+                    for column in columns_by_table.get(table_name, [])
+                }
+                fields = [
+                    field
+                    for field in (
+                        "category_1",
+                        "category_2",
+                        "category_3",
+                        "category_4",
                     )
-                )
-            ]
+                    if field in real_fields
+                ]
+            else:
+                fields = value_fields_map.get(table_name) or [
+                    column.get("name")
+                    for column in columns_by_table.get(table_name, [])
+                    if any(
+                        marker in str(column.get("name") or "").lower()
+                        for marker in (
+                            "category",
+                            "product",
+                            "brand",
+                            "type",
+                            "name",
+                            "model",
+                        )
+                    )
+                ]
             searchable_fields[table_name] = [field for field in fields if field]
 
-        matched, unmatched = [], []
+        matched_evidence: Dict[str, List[dict]] = {}
+        unmatched = []
         for keyword in keywords:
-            keyword_matched = False
             escaped_keyword = (
                 keyword.replace("\\", "\\\\")
                 .replace("'", "''")
                 .replace("%", "\\%")
                 .replace("_", "\\_")
             )
+            keyword_evidence = []
             for table_name, fields in searchable_fields.items():
-                if not fields:
-                    continue
-                conditions = " OR ".join(
-                    f"CAST(`{field.replace('`', '``')}` AS STRING) "
-                    f"LIKE '%{escaped_keyword}%' ESCAPE '\\\\'"
-                    for field in fields
-                )
-                sql = (
-                    f"SELECT 1 FROM `{table_name.replace('`', '``')}` "
-                    f"WHERE {conditions} LIMIT 1"
-                )
-                try:
-                    rows = await self.blocking_func_to_async(connector.run, sql)
-                    # connector.run() 会把列名作为第 1 行插入；至少第 2 行才是真实命中。
-                    if rows and len(rows) > 1:
-                        keyword_matched = True
-                        break
-                except Exception as e:
-                    logger.warning(
-                        "LIKE check failed for %s.%s: %s", table_name, fields, e
+                for field in fields:
+                    escaped_table = table_name.replace("`", "``")
+                    escaped_field = field.replace("`", "``")
+                    sql = (
+                        f"SELECT CAST(`{escaped_field}` AS STRING) AS matched_value "
+                        f"FROM `{escaped_table}` "
+                        f"WHERE CAST(`{escaped_field}` AS STRING) "
+                        f"LIKE '%{escaped_keyword}%' ESCAPE '\\\\' LIMIT 1"
                     )
-            (matched if keyword_matched else unmatched).append(keyword)
-        return matched, unmatched
+                    try:
+                        rows = await self.blocking_func_to_async(connector.run, sql)
+                        # 第 1 行是列名，第 2 行才是首条实际命中值。
+                        if rows and len(rows) > 1:
+                            row = rows[1]
+                            matched_value = row[0] if row else ""
+                            keyword_evidence.append(
+                                {
+                                    "table_name": table_name,
+                                    "column_name": field,
+                                    "matched_value": str(matched_value or ""),
+                                }
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "LIKE check failed for %s.%s: %s", table_name, field, e
+                        )
+            if keyword_evidence:
+                matched_evidence[keyword] = keyword_evidence
+            else:
+                unmatched.append(keyword)
+        return matched_evidence, unmatched
 
     async def map(self, input_value: AgentGenerateContext) -> AgentGenerateContext:
         """执行语义层并把选表结果注入用户消息，然后原样透传。"""
@@ -1399,10 +1427,11 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         )
 
         recall_sql_list = []
-        matched_keywords, recall_keywords = [], []
+        matched_evidence: Dict[str, List[dict]] = {}
+        recall_keywords = []
         if keywords:
             try:
-                matched_keywords, recall_keywords = (
+                matched_evidence, recall_keywords = (
                     await self._split_keywords_for_vector_recall(
                         keywords,
                         result["table_names"],
@@ -1411,17 +1440,16 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                     )
                 )
                 logger.info(
-                    "schema_linking source-table LIKE matched keywords: %s, "
-                    "vector recall keywords: %s",
-                    matched_keywords,
+                    "schema_linking source-table LIKE matched evidence: %s, "
+                    "LIKE unmatched keywords: %s; all keywords use vector recall",
+                    matched_evidence,
                     recall_keywords,
                 )
-                if recall_keywords:
-                    recall_results = await self.blocking_func_to_async(
-                        recall_many, recall_keywords, DEFAULT_MAX_DISTANCE
-                    )
-                    for recall_result in recall_results:
-                        recall_sql_list.extend(recall_result.get("sql", []))
+                recall_results = await self.blocking_func_to_async(
+                    recall_many, keywords, DEFAULT_MAX_DISTANCE
+                )
+                for recall_result in recall_results:
+                    recall_sql_list.extend(recall_result.get("sql", []))
             except Exception as e:
                 logger.warning(f"Keyword LIKE check or vector recall failed, skip: {e}")
 
@@ -1432,7 +1460,10 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             if match and match.group(1) not in recalled_tables:
                 recalled_tables.append(match.group(1))
 
-        # 召回命中了原选表之外的表时，重新构建最终允许表集合和完整结构。
+        # 向量 SQL 会直接引用向量表；有召回 SQL 时，将向量表及命中的来源业务表
+        # 一并加入允许表集合并加载完整结构。
+        if recall_sql_list and TARGET_TABLE not in recalled_tables:
+            recalled_tables.append(TARGET_TABLE)
         if recalled_tables:
             result = await self._run_schema_linking(
                 question,
@@ -1440,30 +1471,33 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                 recalled_table_names=recalled_tables,
             )
         keyword_filter_context = ""
-        if matched_keywords:
+        if matched_evidence:
+            evidence_lines = []
+            for keyword, evidence_items in matched_evidence.items():
+                evidence_lines.append(f"- 关键词：{keyword}")
+                for item in evidence_items:
+                    evidence_lines.append(
+                        "  - 表：{table_name}；字段：{column_name}；命中值：{matched_value}".format(
+                            **item
+                        )
+                    )
             keyword_filter_context += (
-                "\n\n可直接使用数据库普通模糊匹配的关键词：\n"
-                + "、".join(matched_keywords)
-                + "\n这些关键词无需向量召回。请由 DataScientist 根据允许表的字段语义，"
-                "在最终分析 SQL 中使用 LIKE '%关键词%' 生成合适的过滤条件。"
+                "\n\n原始业务表中的普通模糊匹配证据（LIKE '%关键词%'）：\n"
+                + "\n".join(evidence_lines)
+            )
+        if recall_keywords:
+            keyword_filter_context += (
+                "\n\n原始业务表中未直接模糊匹配的关键词：\n"
+                + "、".join(recall_keywords)
             )
         if recall_sql_list:
             keyword_filter_context += (
-                "\n\n无法通过普通模糊匹配直接命中的关键词，需要使用以下向量召回 SQL。"
-                "每条 SQL 开头的 # 注释也属于提示信息：\n"
+                "\n\n所有关键词对应的完整向量召回 SQL：\n"
                 + "\n\n".join(recall_sql_list)
             )
 
         # 允许表 = Schema Linking 选中的表 + 召回 SQL 注释中的来源表。
         input_value.message.content = (
-            "以下数据表由语义层选表和向量召回共同确定（含表间关联关系与完整表结构），"
-            "请严格使用下面列出的表生成 SQL 进行数据分析，禁止使用除此之外的任何表，"
-            "禁止编造字段名，禁止添加库名前缀。普通模糊匹配与向量召回仅用于帮助你"
-            "构造最终过滤条件，最终业务分析 SQL 仍由你生成。向量召回 SQL 用于定位"
-            "实体真实值和主键，请将其作为最终分析 SQL 的子查询或过滤依据，不要直接"
-            "返回召回 SQL。必须完整实现用户问题的所有量化要求：例如 TOP3/前N/排名"
-            "必须用窗口函数或 LIMIT 取前N，聚合、分组、排序与问题口径一致；"
-            "生成 SQL 后逐项自查。\n\n"
             f"允许使用的表及表间关联关系:\n{result['selected_text']}\n\n"
             f"允许使用表的完整表结构（字段、类型、主键、注释）:\n{result['schemas_text']}"
             f"{keyword_filter_context}\n\n"
