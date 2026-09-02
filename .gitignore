@@ -190,6 +190,7 @@ thirdparty
 /i18n/locales/**/**/*_ai_translated.po
 /i18n/locales/**/**/*~
 configs/my
+configs/llm.toml
 .devcontainer/dev.toml
 test_docs
 
@@ -212,4 +213,7 @@ test_docs
 .superpowers/
 openspec/
 docs/superpowers/
+
+# 旧前端备份目录
+web_bak_old/
 .gstack/
