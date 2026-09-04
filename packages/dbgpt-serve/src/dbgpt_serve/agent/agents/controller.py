@@ -576,8 +576,13 @@ class MultiAgents(BaseComponent, ABC):
                     if final_message:
                         current_message.add_view_message(final_message)
                 else:
-                    default_final_message = default_final_message.replace("data:", "")
-                    current_message.add_view_message(default_final_message)
+                    # 客户端在 agent 首条 chunk 产出前断开时 default_final_message
+                    # 仍为 None（语义层耗时长时常见），需要判空避免崩溃
+                    if default_final_message:
+                        default_final_message = default_final_message.replace(
+                            "data:", ""
+                        )
+                        current_message.add_view_message(default_final_message)
 
                 current_message.end_current_round()
                 current_message.save_to_storage()

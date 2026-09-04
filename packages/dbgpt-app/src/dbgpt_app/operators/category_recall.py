@@ -55,11 +55,20 @@ def build_source_sql(
     join_conditions = " OR\n    ".join(
         f"t1.{quote_identifier(name)} = t2.`raw_data`" for name in column_names
     )
+    # key_word 可能是复合主键（逗号分隔的多列，如 comment_id,opinion_id），
+    # 必须拆成单列逐列展开，避免把整串 "c1,c2" 当列名加反引号生成坏 SQL。
+    # 单列主键时行为与原来完全一致。
+    key_columns = [k.strip() for k in key_word.split(",") if k.strip()]
+    if not key_columns:
+        key_columns = [key_word]
+    select_key_columns = ",\n    ".join(
+        f"t1.{quote_identifier(k)}" for k in key_columns
+    )
     return "\n".join(
         [
-            f"# 关键词:{query} 来自表 {table_name}，主键 {key_word}，命中列 {', '.join(column_names)}",
+            f"-- 关键词:{query} 来自表 {table_name}，主键 {key_word}，命中列 {', '.join(column_names)}",
             "SELECT DISTINCT",
-            f"    t1.{quote_identifier(key_word)}",
+            f"    {select_key_columns}",
             f"FROM {quote_identifier(DATABASE)}.{quote_identifier(table_name)} AS t1",
             "LEFT JOIN (",
             "    SELECT DISTINCT `raw_data`",

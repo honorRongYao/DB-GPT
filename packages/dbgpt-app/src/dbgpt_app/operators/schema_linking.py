@@ -1,16 +1,12 @@
 """语义层（Schema Linking）检索算子。
 
-替代默认的 HODatasourceRetrieverOperator，解决"给大模型的表结构参考不准"问题。
-官方默认的数据源检索算子走的是向量摘要检索（top_k 截断字段、无表间关联关系、
-无语义维护），导致 LLM 生成 SQL 时拿到的表结构不完整、join 关系靠猜。
+替代默认 HODatasourceRetrieverOperator，解决"给大模型的表结构参考不准"问题：
+官方算子走向量摘要检索（top_k 截断字段、无关联关系、无语义维护），导致 LLM 写 SQL 时
+表结构不全、join 靠猜。本算子采用两阶段 Schema Linking：
 
-本算子采用业界主流的两阶段 Schema Linking 思路：
-  1. 全量轻目录：列出数据库中所有表（表名 + 表注释，注释中可维护业务语义与表间关联关系），
-     目录很小（每张表一行），全部喂给 LLM 也不会有 token 压力；
-  2. LLM 选表 + 关联关系：把目录和用户问题交给 LLM，LLM 判断要查询哪些表，
-     以及表与表之间的关联关系（通过哪个字段 join、一对多/多对一）；
-  3. 全字段加载：对 LLM 选中的表调用 get_columns() 加载全部字段（不截断，
-     含类型/主键/字段注释），并过滤掉 LLM 编造的不存在表名。
+1. 全量轻目录：所有表（表名+注释，注释维护业务语义与关联关系），每表一行，全量给 LLM 无 token 压力；
+2. LLM 选表 + 关联：判断用哪些表、表间靠什么字段关联（一对多/多对一）；
+3. 全字段加载：对选中表加载全部字段（类型/主键/注释，不截断），过滤 LLM 编造的表名。
 
 输出类型与 HODatasourceRetrieverOperator 一致（HOContextBody），画布上可直接替换接线。
 """
@@ -18,7 +14,7 @@
 import json
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from dbgpt.agent import AgentGenerateContext
 from dbgpt.agent.resource.database import DBResource
@@ -46,127 +42,105 @@ from .llm import HOContextBody
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_SELECT_TABLE_PROMPT = """你是一个数据库专家，负责为用户的查询问题选出正确的数据表，并判断表与表之间的关联关系。
+# 关键词提取后最多保留的实体词个数，防止一次问题提取过多词导致串行召回次数暴涨
+MAX_EXTRACT_KEYWORDS = 5
 
-下面是数据库 {db_name} 中所有可用表的目录（格式：表名 -- 表注释；表注释中可能包含该表的业务含义、字段说明以及与其他表的关联关系，请仔细阅读）：
+_DEFAULT_SELECT_TABLE_PROMPT = """你是一个数据库专家，请为用户问题选出所需数据表，并说明表间关联关系。
 
+数据库 {db_name} 全部可用表目录（格式：表名 -- 表注释；注释含业务含义、字段说明及与其他表的关联关系，请仔细阅读）：
 {table_catalog}
 
-请根据用户问题，从目录中选出生成 SQL 所需的相关表（可能是一张或多张），并判断表与表之间的关联关系（例如通过哪个字段 join、是一对多还是多对一）。
-
 参考示例：
-示例1：
 用户问题：查询每个用户的订单总金额
 输出：{{"tables": [{{"table": "orders", "relation": "通过 user_id 关联 user 表（多对一）"}}, {{"table": "user", "relation": "与 orders 通过 user_id 关联（一对多）"}}]}}
 
 要求：
-1. 表名必须与目录中的名字完全一致，原样输出，禁止编造、禁止改写大小写、禁止添加库名前缀。
-2. 只能从目录中选择表，禁止编造不存在的表名。
-3. 如果问题需要多张表，必须把建立关联所需的所有表都选出来；如果单表即可回答，只选一张，relation 留空字符串。
-4. 选表数量尽量精简，一般不要超过 {max_selected_tables} 张。
-5. 当用户问题中的过滤概念（品类、品牌、状态、类型、名称等业务维度）在事实表中只有外键（如 category_id）而没有对应的名称字段时，必须把该维度表一并选出用于 WHERE 过滤；宁可多选一张表，也不能让过滤条件无法准确表达。漏选维度表是常见错误，会导致 SQL 过滤条件错误、结果不准。
-6. 多表关联时，每张选中的表都必须填写 relation，描述该表与其他表的关联关系，不能留空：
-   - 如果该表通过某字段关联其他表（事实表），写"通过 XX 字段关联 YY 表（多对一）"，如：通过 user_id 关联 user 表（多对一）；
-   - 如果该表是被其他表引用的维度表，写"被 YY 表通过 XX 字段引用（一对多）"，如：被 orders 表通过 user_id 引用（一对多）。
-7. 输出严格 JSON，不要包含任何其他解释文字，格式如下：
+1. 表名必须与目录完全一致原样输出，禁止编造、改大小写、加库名前缀；只能从目录选。
+2. 多表才能回答的问题，关联所需表必须选全；单表可回答则只选一张，relation 留空。
+3. 选表精简，一般不超过 {max_selected_tables} 张。
+4. 问题中的过滤概念（品类/品牌/状态/类型/名称等）在事实表中只有外键（如 category_id）而无名称字段时，必须补选对应维度表用于 WHERE；宁可多选也不能让过滤条件无法表达，漏选维度表是常见错误。
+5. 多表关联时每张表都要写 relation：
+   - 事实表（引用他表）：写"通过 XX 字段关联 YY 表（多对一）"，如：通过 user_id 关联 user 表（多对一）；
+   - 被引用的维度表：写"被 YY 表通过 XX 字段引用（一对多）"，如：被 orders 表通过 user_id 引用（一对多）。
+6. 只输出严格 JSON，不要任何解释文字：
 {{
   "tables": [
-    {{"table": "表名", "relation": "该表与其他表的关联关系说明，如：通过 user_id 关联 user 表（多对一）"}}
+    {{"table": "表名", "relation": "关联关系说明，如：通过 user_id 关联 user 表（多对一）"}}
   ]
 }}
 """
 
-_DEFAULT_SELECT_VALUE_FIELDS_PROMPT = """你是一个数据库专家。下面是语义层根据用户问题选出的数据表及其完整字段定义（格式：字段名 类型 [主键] -- 注释）：
-
+_DEFAULT_SELECT_VALUE_FIELDS_PROMPT = """你是数据库专家。下面是根据用户问题选出的数据表及其完整字段（格式：字段名 类型 [主键] -- 注释）：
 {schemas}
 
-请判断：为了正确生成 SQL 的 WHERE 过滤条件，哪些字段的真实取值可能有参考价值？
-只要该字段的取值在 SQL 中可能被用到（例如可能用于 WHERE 过滤、分组、精确匹配、模糊匹配，或取值属于枚举型/有限集合/大小写敏感需要原样书写的字段：品类、状态、日期、品牌、类型、ID 等），都应该选出来。
+请挑选"真实取值对正确写 WHERE 有参考价值"的字段：只要取值可能用于过滤/分组/精确或模糊匹配/大小写敏感需原样书写的字段（品类、状态、日期、品牌、类型、ID 等枚举/有限集合型）都选上。
+宁可多选不漏选：LLM 参考真实取值可避免猜错过滤值导致查不到结果。
 
-宁可多选也不要漏选：只要觉得可能有参考价值的字段都选出来，LLM 写 SQL 时参考真实取值可以避免猜错过滤值（取值猜错会导致过滤条件错误、查不到结果）。
-
-输出每张表最多 5 个这样的字段（优先选最可能有参考价值的），格式为严格 JSON（只输出 JSON，不要任何解释）：
+每张表最多输出 5 个，只输出严格 JSON：
 {{"value_fields": {{"表名1": ["字段a", "字段b"], "表名2": ["字段c"]}}}}
-
-如果某张表确实没有任何需要参考取值的字段，该表就不出现在结果中。
+某张表确实无需参考取值的，不要出现在结果中。
 """
 
-_DEFAULT_VERIFY_VALUE_FIELDS_PROMPT = """你是数据库专家。下面是已选表中需要参考真实取值的字段，以及这些字段查到的真实数据（每字段最多3个取值）：
-
+_DEFAULT_VERIFY_VALUE_FIELDS_PROMPT = """你是数据库专家。下面是已选"需参考真实取值"的字段及其真实数据（每字段最多3个取值）：
 {field_values}
 
 用户问题：{question}
 
-请判断：这些字段的真实取值，是否足以帮你正确写出 WHERE 过滤条件（品类、品牌、日期、状态等业务维度的取值是否准确、可用的过滤值是否齐全）？
+判断：这些真实取值是否足以正确写出 WHERE 过滤条件（品类/品牌/日期/状态等维度取值是否准确、可用过滤值是否齐全）？重点检查：
+1. 问题里的业务过滤概念是否已有字段能看到真实取值？取值里看不到问题提到的概念（如问题说"电动风扇"，取值只有"风扇/塔式风扇"）时，需补充品类/标题类字段确认真实叫法；
+2. 时间过滤字段（dt/date 等）有无取值参考；
+3. 已选字段取值是否异常（全空/类型不符/字段名错误）。
 
-重点检查：
-1. 用户问题中出现的业务过滤概念（品类、品牌、商品类型等），是否已有字段能看到对应的真实取值？若取值里看不到问题提到的概念（如问题说"电动风扇"，但取值里只有"风扇/塔式风扇"），说明需要补充品类/标题类字段来确认真实叫法。
-2. 时间过滤字段（如 dt、date）是否有取值参考？
-3. 已选字段查出的取值是否异常（全空、类型不符、字段名错误）？
-
-若已足够，输出：{{"sufficient": true, "add_fields": {}}}
-若不足，从已选表的完整字段中补充字段，输出：
+足够，输出：{{"sufficient": true, "add_fields": {{}}}}
+不足，从已选表完整字段中补充（每表不超 5 个、禁止编造字段名）：
 {{"sufficient": false, "add_fields": {{"表名": ["补充字段1", "补充字段2"]}}}}
-
-要求：
-1. 只能补充已选表真实存在的字段，禁止编造字段名。
-2. 每张表补充字段不超过 5 个。
-3. 输出严格 JSON，不要包含任何其他解释文字。
+只输出严格 JSON。
 """
 
-_DEFAULT_VERIFY_TABLES_PROMPT = """你是一个数据库专家。下面是初步选出的数据表（含字段列表与表注释），以及数据库中全部可用表的目录。
+_DEFAULT_VERIFY_TABLES_PROMPT = """你是数据库专家。校验"已选表字段是否足以完整回答用户问题"（WHERE 过滤、聚合、分组、排序所需维度），不足则补表。
 
-当前已选表：
+当前已选表（含字段与注释）：
 {selected_tables}
 
 全表目录（补充表只能从这里选）：
 {table_catalog}
 
-请校验：当前已选表的字段，是否足以完整回答用户问题（包括 WHERE 过滤、聚合、分组、排序所需的全部维度）？重点检查：
-1. 用户问题中出现的业务过滤概念（品类、品牌、状态、类型、名称等），已选表中是否有对应的名称字段可直接表达？
-   如果只有外键（如 category_id）而没有名称字段（如 category_1、category_2），则缺少对应的维度表，必须补充。
-2. 统计口径所需字段（销量、金额、时间等）是否齐全。
-3. 时间等过滤字段是否存在，字段类型是否与问题口径匹配（如日期是 date、年月是 varchar 格式 202607）。
+重点检查：
+1. 问题里的过滤概念（品类/品牌/状态/类型/名称等）是否有名称字段可直接表达？若只有外键（category_id）而无名称字段（category_1/2…），则缺对应维度表，必须补充；
+2. 统计口径字段（销量/金额/时间）是否齐全；
+3. 时间过滤字段类型是否与问题口径匹配（如年月是 varchar 202607）。
 
-若已选表已足够，输出：{{"sufficient": true, "missing_tables": []}}
-若不足，从全表目录中选出缺失的表（可多张），输出：
+足够，输出：{{"sufficient": true, "missing_tables": []}}
+不足，从全表目录选缺失表（可多张）：
 {{"sufficient": false, "missing_tables": [{{"table": "表名", "reason": "补充原因"}}]}}
-
-要求：
-1. 表名必须与全表目录完全一致，禁止编造。
-2. 只补充真正缺失的表，不要重复已选中的表。
-3. 输出严格 JSON，不要包含任何其他解释文字。
+要求：表名与目录完全一致、禁止编造；只补真正缺失的表；只输出严格 JSON。
 """
 
-_DEFAULT_REWRITE_QUESTION_PROMPT = """你是一个对话理解助手。下面是当前用户问题出现之前的最近几轮对话记录：
-
+_DEFAULT_REWRITE_QUESTION_PROMPT = """你是对话理解助手。下面是当前问题出现前的最近几轮对话记录：
 {history}
 
-请判断：当前用户问题是否引用了前文对话中的内容？
-判断依据（满足任意一条即可认为引用了前文）：
-1. 出现指代词：那、这个、它、上面、刚才、环比、同比、继续、再、还、结果、数据等；
-2. 缺少主语或实体：没有明确提到品类/品牌/表/统计对象；
-3. 缺少时间基准或统计口径：如"环比是多少"没有说明对比的是哪一期、哪个范围的数据；
-4. 与前一问属于同一话题的追问。
+判断：当前用户问题是否引用了前文？满足任一即算引用：
+1. 含指代词（那/这个/它/上面/刚才/环比/同比/继续/再/还/结果/数据）；
+2. 缺主语或实体（没提品类/品牌/统计对象）；
+3. 缺时间基准或口径（如"环比是多少"没说对比哪期哪个范围）；
+4. 与前一问属同一话题的追问。
 
-- 若引用了前文，把当前问题改写为一个自包含的完整问题：把前文中的实体（品类/品牌/商品等）、
-时间范围（如 Q1、202601-202603）、过滤条件、统计口径明确写进问题，
-使改写后的问题脱离前文也能独立理解。
-- 若没有引用前文，保持原问题不变，原样输出。
+若引用前文：改写为自包含的完整问题，把前文的实体（品类/品牌/商品）、时间范围（如 Q1、202601-202603）、过滤条件、统计口径写进问题，脱离前文也能独立理解。
+若未引用：保持原问题原样输出。
 
-只输出严格 JSON，不要包含任何其他解释文字：
+只输出严格 JSON：
 {{"related": true 或 false, "rewritten_question": "改写后的完整问题（related 为 false 时与原问题相同）"}}
 """
 
 _DEFAULT_EXTRACT_KEYWORDS_PROMPT = """你是一个数据分析助手。请从用户问题中提取"关键实体词"，用于后续语义检索（向量匹配）和选表参考。
 
 提取规则：
-1. 只提取需要"去库里匹配真实取值"的实体词：品类名（咖啡机、空调、风扇）、品牌名（苏泊尔、美的）、评论打标词（异味、噪音大、好评）、地区（广东省、华东地区）、商品/标题实体（咖啡机pro版）等。
-2. 不提取：指标（销量、金额、评论数）、时间（2026年、Q1、上半年）、动作词（分析、对比、列出）、排序/占比修饰（前3、环比、占比）、虚词助词。
-3. 用户问题包含多个独立诉求时（如"分析评论，同时对比销量"），每个诉求里的关键实体词都要提取，不要遗漏。
-4. 同一个实体只保留一次，去重。
-5. 品牌名与品类名连用时（如"德龙咖啡机""美的空调"），拆成品牌名和品类名两个词分别提取，不要保留组合词。
-6. 不提取型号/版本后缀（如 pro、plus、max、2026款）；型号主体（如 AC-555）作为整体提取。
+1. 只提取需要"去库里匹配真实取值"的实体词：品类名（咖啡机、空调、风扇）、品牌名（苏泊尔、美的）、评论打标词（异味、噪音大、好评）、地区（广东省、华东地区）等。
+2. 词要尽量短、去修饰、去广告化，贴近数据库里真实存储的叫法（如短品类词"吹风机"，而不是"吹风机pro版超强风速大风量"这种口语长词），这样向量检索才能精确命中库里已有的取值。
+3. 不提取：指标（销量、金额、评论数）、时间（2026年、Q1、上半年）、动作词（分析、对比、列出）、排序/占比修饰（前3、环比、占比）、数据表字段/统计单位名（如 ASIN、SKU、asin、parent_asin、comment_id、category_id）、型号/版本后缀（pro、plus、max、2026款，如"咖啡机pro版"只保留"咖啡机"）、虚词助词。
+4. 用户问题包含多个独立诉求时（如"分析评论，同时对比销量"），每个诉求里的关键实体词都要提取，不要遗漏。
+5. 同一个实体只保留一次，去重。
+6. 品牌名与品类名连用时（如"德龙咖啡机""美的空调"），拆成品牌名和品类名两个词分别提取，不要保留组合词。
 7. 提取结果若存在包含关系（如"德龙咖啡机"包含"咖啡机"），只保留最小粒度的词。
 
 输出严格 JSON（只输出 JSON，不要任何解释文字）：
@@ -177,6 +151,50 @@ _DEFAULT_EXTRACT_KEYWORDS_PROMPT = """你是一个数据分析助手。请从用
 
 示例2 输入：分别统计广东省和华东地区电动风扇的销量
 输出：{"关键词列表": ["广东省", "华东地区", "电动风扇"]}
+"""
+
+_DEFAULT_TABLE_VERIFY_PROMPT = """你是数据库专家。对查询方案做"表级校验"，一次输出两组动作：补缺失表（missing_tables）、剔无关表（drop_tables）。召回 SQL 的审核在下一步单独做，本步不要关心召回。
+
+用户问题：{question}
+
+一、当前候选表（格式：表名 -- 表注释（来源：LLM自选/向量召回带入/兜底；字段：字段1, 字段2））：
+{selected_schemas}
+
+二、全部可用表目录（补充表只能从这里选）：
+{table_catalog}
+
+校验原则：
+1. 候选表字段是否足以回答用户问题（过滤/聚合/分组/排序维度齐备）？不足则从目录补缺失表入 missing_tables（附原因）。如问题按品类过滤、销售表只有 category_id 外键，必须补品类维度表。
+2. 与问题统计口径无关的表（如问销量却带进来的评论/打标表）放入 drop_tables。LLM 自选表除非确实与问题无关否则保留——宁可多留，不误删必需表。
+
+只输出严格 JSON：
+{{"missing_tables": [{{"table": "表名", "reason": "补充原因"}}], "drop_tables": ["表名"]}}
+要求：表名与全表目录完全一致、禁止编造；category_embedding 是内部向量表，永远不允许进入表集合；两个键都不能省略，无动作时输出空数组。
+"""
+
+_DEFAULT_RECALL_VERIFY_PROMPT = """你是数据库专家。这是"召回审核"（表级校验后的第二步）：逐条判断每条"关键词向量召回"对回答用户问题是否有意义，无意义的序号放入 drop_recalls。
+
+用户问题：{question}
+
+允许使用的业务表（召回来源表不在此名单即无意义；category_embedding 是内部向量表，永不直接使用）：
+{allowed_tables}
+
+向量召回清单（每条 = 序号. 关键词；来源表（表注释）；命中列）：
+{recall_rows}
+
+逐条判断原则：
+1. 口径匹配：来源表是否属于回答该问题必需的统计对象/维度（查销量需销售表+品类维度表；查评论分析才需评论/打标表）。召回到与问题统计口径无关的表是噪音，剔除；
+2. 命中列语义：命中列能否定位问题中的过滤实体（品类名/品牌名/标题等实体名词列）。观点词、评论片段、情感词等"非实体定位"列，在纯统计/销量类问题里无法用于过滤，剔除；仅当问题本身要求按这些词筛选（如分析某品类差评提到的问题）才保留；
+3. 冗余性：同一关键词已有更合适召回（如品类表 category_x 列）时，旁路观点/明细类表的同词召回通常冗余，剔除。
+
+示例：用户问题"2026年5月咖啡机的销售情况"
+允许表：dwd_mkt_product_sales_data、dim_product_category
+召回1. 咖啡机；来源表：dim_product_category（品类维度表）；命中列：category_2, category_3, category_4 → 可用于定位咖啡机品类做 WHERE 过滤 → 保留
+召回2. 咖啡机；来源表：dwm_absa_comment_detail（评论打标表）；命中列：cb_big_word（观点）→ 对销量口径无用、来源表不在允许名单 → 放入 drop_recalls
+
+只输出严格 JSON：
+{{"drop_recalls": [无用召回的序号]}}
+要求：drop_recalls 只列确定无用的；允许表名单之外的表产生的召回一律无用（其来源表已在表级校验中剔除）；无向量召回时输出空数组。
 """
 
 # 追问补全相关常量：历史只取最近几轮（每轮只留头尾）、单条内容截断，避免上下文撑爆模型输入
@@ -324,20 +342,8 @@ _OUTPUTS_CONTEXT = IOField.build_from(
 
 
 class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOContextBody]):
-    """语义层检索算子（Datasource Schema Linking Operator）。
-
-    核心价值：替代官方"数据源检索算子"（向量摘要 top_k 截断、无关联关系），
-    让 LLM 生成 SQL 前先经过"两阶段 Schema Linking"：
-      阶段1：全量轻目录 -> LLM 选表 + 判断表间关联关系；
-      阶段2：按选中表加载全部字段（不截断），过滤编造表名。
-
-    典型接线（画布）：
-      通用大语言模型 HTTP 触发器.out.1 (Request String Messages)
-        -> 本算子.in.0 (User question)
-      数据源资源 -> 本算子.参数.datasource
-      本算子.out.0 (Retrieved context)
-        -> 大语言模型算子.in.1 (extra_context)
-    """
+    """语义层检索算子（Datasource Schema Linking Operator）：先全量目录+LLM 选表+关联，
+    再对选中表加载全字段（不截断、过滤编造表名），输出 HOContextBody 与官方算子兼容，可直接替换接线。"""
 
     metadata = ViewMetadata(
         label=_("Datasource Schema Linking Operator"),
@@ -376,18 +382,9 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         enum_limit: int = 3,
         **kwargs,
     ):
-        """初始化语义层检索算子。
-
-        参数说明：
-            datasource: 数据源资源（必填），用于读取表名/注释/字段
-            prompt_template: 选表提示词模板，占位符支持 {db_name}/{table_catalog}/{max_selected_tables}，用户问题自动作为 user 消息传入
-            model: 选表使用的模型名称，留空用默认模型
-            llm_client: LLM 客户端，留空用系统默认
-            max_selected_tables: 最多加载几张选中表的全字段
-            context_key: 输出上下文对象的键名，默认 "context"，与下游提示词 {context} 对应
-            enum_enabled: 是否对 LLM 指定的 value_fields 字段枚举真实取值（默认开启）
-            enum_limit: 每个字段最多枚举多少个取值（默认 3，可调）
-        """
+        """datasource: 数据源（必填）；prompt_template: 选表提示词模板（{db_name}/{table_catalog}/{max_selected_tables}）；
+        model/llm_client: 选表模型，留空用默认；max_selected_tables: 最多加载几张表全字段；
+        context_key: 输出键名（默认 context）；enum_enabled/enum_limit: 是否枚举 value_fields 真实取值及其条数。"""
         MapOperator.__init__(self, **kwargs)
         MixinLLMOperator.__init__(self, llm_client, save_model_output=False)
         self._datasource = datasource
@@ -400,11 +397,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
     # ---------------- 1. 全量轻目录 ----------------
     async def _build_table_catalog(self) -> List[str]:
-        """列出全部可用表（表名 + 表注释）。
-
-        表注释是语义维护的载体：建议在注释中写明业务含义以及该表与其他表的关联关系，
-        语义层每次全量读取，保证"目录 + 关系"完整无截断。
-        """
+        """列出全部可用表（表名 + 表注释，注释承载业务语义与关联关系，全量无截断）。"""
         connector = self._datasource.connector
         table_names = await self.blocking_func_to_async(connector.get_table_names)
         table_names = list(table_names)
@@ -432,12 +425,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         return catalog
 
     async def _get_comment_by_show_create(self, connector, table_name: str) -> str:
-        """用 SHOW CREATE TABLE 解析表级 COMMENT，作为注释兜底。
-
-        information_schema 读不到注释时（如 Doris/StarRocks），SHOW CREATE TABLE 会带出
-        建表语句中的表级 COMMENT。列注释也是 COMMENT '...'，表级注释在语句末尾，
-        因此取最后一个匹配项。
-        """
+        """SHOW CREATE TABLE 解析表级 COMMENT 兜底（表级注释在语句末尾，取最后一个匹配）。"""
         try:
             rows = await self.blocking_func_to_async(
                 connector.run, f"SHOW CREATE TABLE {table_name}"
@@ -458,14 +446,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
     async def _get_columns_with_fallback(
         self, connector, table_name: str
     ) -> List[dict]:
-        """加载表字段；get_columns 失败/为空时用 SHOW CREATE TABLE 解析兜底。
-
-        Doris 等引擎的 information_schema 元数据查询慢，偶发连接超时
-        （Lost connection to MySQL server）或事务未回滚（Can't reconnect），
-        导致 get_columns 返回空或抛异常，表结构字段为空、LLM 只能猜字段名。
-        SHOW CREATE TABLE 走普通 SQL 执行（session_scope 自动提交/回滚），
-        对 Doris 支持可靠，作为字段加载的兜底。
-        """
+        """加载表字段；get_columns 失败/为空（Doris 元数据连接超时）时用 SHOW CREATE TABLE 解析兜底。"""
         try:
             columns = await self.blocking_func_to_async(
                 connector.get_columns, table_name
@@ -492,10 +473,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
     @staticmethod
     def _parse_columns_from_create_sql(create_sql: str) -> List[dict]:
-        """从 SHOW CREATE TABLE 语句解析列定义（列名/类型/注释）。
-
-        与 connector.get_columns 返回结构兼容：name/type/comment/is_in_primary_key。
-        """
+        """从 SHOW CREATE TABLE 解析列定义，返回结构与 get_columns 兼容（name/type/comment/is_in_primary_key）。"""
         start = create_sql.find("(")
         end = create_sql.rfind(")")
         if start == -1 or end == -1 or end <= start:
@@ -541,34 +519,41 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         """调用 LLM 从目录中选择相关表并判断关联关系。
 
         keywords_text: 从问题提取的关键实体词文本，附加到 user 消息辅助选表。
+        失败策略：模板格式化失败 / LLM 调用失败 / 返回空结果 → 重试 1 次；
+        重试仍失败才兜底返回全表，保证流程不中断。
         """
         catalog_str = "\n".join(
             f"{i + 1}. {item}" for i, item in enumerate(catalog)
         )
-        try:
-            prompt = self._prompt_template.format(
-                db_name=self._datasource._db_name,
-                table_catalog=catalog_str,
-                max_selected_tables=self._max_selected_tables,
+        # system 放角色/目录/要求，user 放用户问题（DB-GPT 枚举用 HUMAN 表示用户消息）
+        user_content = f"用户问题：{question}"
+        if keywords_text:
+            user_content += (
+                f"\n\n用户问题中的关键实体词（选表请覆盖这些实体所在的表）：\n{keywords_text}"
             )
-        except Exception as e:
-            logger.warning(
-                f"Select table prompt template format failed ({e}), "
-                f"fallback to all tables"
-            )
-            return self._fallback_all_tables(catalog)
-        try:
-            # system 放角色/目录/要求，user 放用户问题（DB-GPT 枚举用 HUMAN 表示用户消息）
-            user_content = f"用户问题：{question}"
-            if keywords_text:
-                user_content += (
-                    f"\n\n用户问题中的关键实体词（选表请覆盖这些实体所在的表）：\n{keywords_text}"
+        last_err = ""
+        for attempt in range(1, 3):  # 首次尝试 + 重试 1 次
+            try:
+                prompt = self._prompt_template.format(
+                    db_name=self._datasource._db_name,
+                    table_catalog=catalog_str,
+                    max_selected_tables=self._max_selected_tables,
                 )
-            output = await self._llm_complete(prompt, user_content)
-            return self._parse_table_selection(output)
-        except Exception as e:
-            logger.warning(f"LLM select tables failed, fallback to all tables: {e}")
-            return self._fallback_all_tables(catalog)
+                output = await self._llm_complete(prompt, user_content)
+                result = self._parse_table_selection(output)
+                if result:
+                    return result
+                last_err = "LLM returned empty table selection"
+            except Exception as e:
+                last_err = str(e)
+            logger.warning(
+                f"Select tables attempt {attempt}/2 failed ({last_err}), retrying"
+            )
+        logger.warning(
+            f"Select tables still failed after retry ({last_err}), "
+            f"fallback to all tables"
+        )
+        return self._fallback_all_tables(catalog)
 
     @staticmethod
     def _fallback_all_tables(catalog: List[str]) -> List[dict]:
@@ -611,10 +596,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
     @staticmethod
     def _parse_json_strict(text: str) -> dict:
-        """容错解析 LLM 输出的 JSON：优先整体解析，失败则截取首个 { 到最后一个 } 再解析。
-
-        兼容 LLM 常见输出问题：中文引号“”、中文冒号：等。
-        """
+        """容错解析 LLM 输出的 JSON：兼容中文引号/冒号；整体失败则截取首个 { 到末个 } 再解析。"""
         text = text.strip()
         text = (
             text.replace("“", '"')
@@ -647,11 +629,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
     # ---------------- 3. 按选中表加载全字段 ----------------
     @staticmethod
     def _extract_business_comment(comment: str) -> str:
-        """从表注释中提取业务含义部分，关联关系部分不展示。
-
-        约定表注释格式："业务含义；关联关系"。业务含义（第一个分号之前）展示在
-        表结构中；关联关系（分号之后）仅供选表 LLM 在目录中读取，不在这里重复出现。
-        """
+        """表结构里只展示业务含义（第一个分号前）；分号后的关联关系在目录/关联清单中已给，不重复。"""
         for sep in ("；", ";"):
             if sep in comment:
                 return comment.split(sep, 1)[0].strip()
@@ -677,11 +655,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         columns_by_table: dict,
         value_fields_map: dict,
     ) -> str:
-        """按选中表拼装完整表结构文本（字段/类型/主键/注释 + 值域枚举）。
-
-        表注释只展示业务含义（第一个分号前），分号后的关联关系不重复展示，
-        关联关系已由"根据用户问题选择的表及表间关联关系"节给出。
-        """
+        """按选中表拼装完整表结构（字段/类型/主键/注释 + 值域枚举真实取值参考）。"""
         connector = self._datasource.connector
         schemas = []
         for table_name in table_names:
@@ -697,9 +671,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 )
             else:
                 schema = f"{table_name}(\n" + "\n".join(col_lines) + "\n)"
-            # 值域枚举：对 LLM 确认的 value_fields 字段一次查询多字段，
-            # 取最常见的 N 行真实取值组合（每行各值横向对应字段名顺序）；
-            # 帮助 LLM 写对 WHERE 条件值（如品类值实际是"咖啡机（配件）"而非"咖啡机"）
+            # 值域枚举：对 value_fields 查前 N 行真实取值，帮 LLM 写对 WHERE 过滤值
             if self._enum_enabled:
                 vf_list = value_fields_map.get(table_name, [])
                 if vf_list:
@@ -729,7 +701,8 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
     ) -> dict:
         """字段确认步骤：LLM 看到选中表完整字段后，指定需要参考真实取值的字段。
 
-        返回 {表名: [字段, ...]}；未开启值域枚举或 LLM 调用失败时返回空 dict。
+        返回 {表名: [字段, ...]}；未开启值域枚举时返回空 dict（无字段参考属正常结论）。
+        失败策略：LLM 调用失败 / 解析失败 → 重试 1 次；仍失败返回空 dict 跳过该优化。
         """
         if not self._enum_enabled:
             return {}
@@ -741,15 +714,23 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             schema_lines.append(f"{table_name}(\n" + "\n".join(col_lines) + "\n)")
         if not schema_lines:
             return {}
-        try:
-            prompt = _DEFAULT_SELECT_VALUE_FIELDS_PROMPT.format(
-                schemas="\n\n".join(schema_lines)
+        last_err = ""
+        for attempt in range(1, 3):  # 首次尝试 + 重试 1 次
+            try:
+                prompt = _DEFAULT_SELECT_VALUE_FIELDS_PROMPT.format(
+                    schemas="\n\n".join(schema_lines)
+                )
+                output = await self._llm_complete(prompt, f"用户问题：{question}")
+                return self._parse_fields_map(output, "value_fields")
+            except Exception as e:
+                last_err = str(e)
+            logger.warning(
+                f"Select value fields attempt {attempt}/2 failed ({last_err}), retrying"
             )
-            output = await self._llm_complete(prompt, f"用户问题：{question}")
-            return self._parse_fields_map(output, "value_fields")
-        except Exception as e:
-            logger.warning(f"LLM select value fields failed, skip: {e}")
-            return {}
+        logger.warning(
+            f"Select value fields still failed after retry ({last_err}), skip"
+        )
+        return {}
 
     @staticmethod
     def _parse_fields_map(text: str, key: str) -> dict:
@@ -791,7 +772,8 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         用户问题交给 LLM，判断取值是否足以写对 WHERE（如问题说"电动风扇"但取值
         里只有"风扇/塔式风扇"，就需要补品类/标题类字段确认真实叫法）。
         需要时从该表真实字段中补充，去重后合并进 value_fields_map。
-        LLM 调用或解析失败时原样返回，不阻塞主流程。
+        空 add_fields（判断足够）属正常结论不重试；
+        失败策略：LLM 调用失败 / 解析失败 → 重试 1 次；仍失败原样返回，不阻塞主流程。
         """
         if not self._enum_enabled or not value_fields_map:
             return value_fields_map
@@ -810,16 +792,22 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             )
         if not field_lines:
             return value_fields_map
-        try:
-            prompt = _DEFAULT_VERIFY_VALUE_FIELDS_PROMPT.format(
-                field_values="\n\n".join(field_lines),
-                question=question,
+        last_err = ""
+        add_map = {}
+        for attempt in range(1, 3):  # 首次尝试 + 重试 1 次
+            try:
+                prompt = _DEFAULT_VERIFY_VALUE_FIELDS_PROMPT.format(
+                    field_values="\n\n".join(field_lines),
+                    question=question,
+                )
+                output = await self._llm_complete(prompt, f"用户问题：{question}")
+                add_map = self._parse_fields_map(output, "add_fields")
+                break  # 解析成功即算成功（含空 add_fields = 判断足够），不再重试
+            except Exception as e:
+                last_err = str(e)
+            logger.warning(
+                f"Verify value fields attempt {attempt}/2 failed ({last_err}), retrying"
             )
-            output = await self._llm_complete(prompt, f"用户问题：{question}")
-            add_map = self._parse_fields_map(output, "add_fields")
-        except Exception as e:
-            logger.warning(f"Verify value fields failed, keep original fields: {e}")
-            return value_fields_map
         if not add_map:
             return value_fields_map
         # 补充字段只接受真实存在的列名；与已选合并去重，每表最多 5 个
@@ -857,8 +845,8 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
         针对"漏选维度表"这类问题：例如用户问"咖啡机Q1总销量"，销售表只有
         category_id 外键、没有品类名称字段，校验会让 LLM 补充品类维度表。
-        只做表级补充，不修改已选表的字段；LLM 校验失败或解析失败时
-        静默保留原选表结果，不中断主流程。
+        只做表级补充，不修改已选表的字段；sufficient=true（无需补表）属正常结论不重试；
+        失败策略：LLM 调用失败 / 解析失败 → 重试 1 次；仍失败保留原选表结果，不中断主流程。
         """
         if not table_names:
             return table_names
@@ -869,16 +857,22 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             col_names = ", ".join(c.get("name", "") for c in cols)
             comment = catalog_comments.get(t, "")
             schema_lines.append(f"{t} -- {comment}（字段：{col_names}）")
-        try:
-            prompt = _DEFAULT_VERIFY_TABLES_PROMPT.format(
-                selected_tables="\n".join(schema_lines),
-                table_catalog="\n".join(f"- {c}" for c in catalog),
+        last_err = ""
+        sufficient, missing = True, []
+        for attempt in range(1, 3):  # 首次尝试 + 重试 1 次
+            try:
+                prompt = _DEFAULT_VERIFY_TABLES_PROMPT.format(
+                    selected_tables="\n".join(schema_lines),
+                    table_catalog="\n".join(f"- {c}" for c in catalog),
+                )
+                output = await self._llm_complete(prompt, f"用户问题：{question}")
+                sufficient, missing = self._parse_verify_result(output)
+                break  # 解析成功即算成功（sufficient=true = 无需补表），不再重试
+            except Exception as e:
+                last_err = str(e)
+            logger.warning(
+                f"Verify tables attempt {attempt}/2 failed ({last_err}), retrying"
             )
-            output = await self._llm_complete(prompt, f"用户问题：{question}")
-            sufficient, missing = self._parse_verify_result(output)
-        except Exception as e:
-            logger.warning(f"LLM verify tables failed, keep original selection: {e}")
-            return table_names
         if sufficient or not missing:
             return table_names
         catalog_tables = {item.split(" -- ")[0] for item in catalog}
@@ -1023,13 +1017,25 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
     @staticmethod
     def _parse_keywords_result(text: str) -> List[str]:
-        """容错解析关键词提取结果，返回去重后的实体词列表。"""
+        """容错解析关键词提取结果，返回去重后的实体词列表。
+
+        兼容多个候选 JSON 键（关键词列表/关键词/keywords）；
+        结果去重后截断到 MAX_EXTRACT_KEYWORDS 个，防止召回次数暴涨；
+        解析失败或无有效列表时返回空列表，并记录告警。
+        """
         try:
             data = HOSchemaLinkingRetrieverOperator._parse_json_strict(text)
-            kws = data.get("关键词列表")
         except Exception:
-            kws = None
+            logger.warning("Extract keywords parse failed, use empty list")
+            return []
+        kws = None
+        for key in ("关键词列表", "关键词", "keywords"):
+            candidate = data.get(key)
+            if isinstance(candidate, list):
+                kws = candidate
+                break
         if not isinstance(kws, list):
+            logger.warning("Extract keywords output has no valid keyword list, use empty list")
             return []
         seen, out = set(), []
         for k in kws:
@@ -1037,23 +1043,43 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             if s and s not in seen:
                 seen.add(s)
                 out.append(s)
+        if len(out) > MAX_EXTRACT_KEYWORDS:
+            logger.info(
+                "Extract keywords got %d words, keep first %d: %s",
+                len(out),
+                MAX_EXTRACT_KEYWORDS,
+                out[:MAX_EXTRACT_KEYWORDS],
+            )
+            out = out[:MAX_EXTRACT_KEYWORDS]
         return out
 
     async def _extract_keywords(self, question: str) -> List[str]:
         """关键词提取：从改写后的完整问题中提取需要语义检索/选表参考的实体词。
 
         只输出实体词列表（不判断目标字段）；后续可把结果交给向量检索方
-        （返回 {向量子查询, 目标字段} 拼进分析 SQL）。失败或为空时返回
-        空列表，不阻塞主流程。
+        （返回 {向量子查询, 目标字段} 拼进分析 SQL）。
+        失败策略：LLM 调用失败 / 返回空结果 → 重试 1 次；仍失败返回空列表，
+        不阻塞主流程。
         """
-        try:
-            output = await self._llm_complete(
-                _DEFAULT_EXTRACT_KEYWORDS_PROMPT, f"用户问题：{question}"
+        last_err = ""
+        for attempt in range(1, 3):  # 首次尝试 + 重试 1 次
+            try:
+                output = await self._llm_complete(
+                    _DEFAULT_EXTRACT_KEYWORDS_PROMPT, f"用户问题：{question}"
+                )
+                result = self._parse_keywords_result(output)
+                if result:
+                    return result
+                last_err = "LLM returned empty keywords"
+            except Exception as e:
+                last_err = str(e)
+            logger.warning(
+                f"Extract keywords attempt {attempt}/2 failed ({last_err}), retrying"
             )
-            return self._parse_keywords_result(output)
-        except Exception as e:
-            logger.warning(f"Extract keywords failed, use empty list: {e}")
-            return []
+        logger.warning(
+            f"Extract keywords still failed after retry ({last_err}), use empty list"
+        )
+        return []
 
     async def _rewrite_followup_question(
         self, question: str, input_value: AgentGenerateContext
@@ -1064,31 +1090,37 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         DataScientist 的会话记忆同源）。不读 rely_messages：AWEL Agent 流程中
         语义层位于 Agent Trigger 之后、AWEL Agent Operator 之前，起始 context
         未携带 rely_messages（实测恒为空），且 gpts_message 表是 rely 的严格超集。
-        历史不可用、或 LLM 判定/改写失败时，静默返回原问题，不阻塞主流程。
+        历史不可用、或 LLM 判定非追问（related=false）时，直接返回原问题，不重试。
+        失败策略：LLM 调用失败 / 解析失败 / 判定需改写却未产出有效改写 →
+        重试 1 次；仍失败静默返回原问题，不阻塞主流程。
         """
         current = self._strip_schema_linking_text(question).strip()
         history = await self._build_history_text_from_db(input_value)
         if not history:
             return question
-        try:
-            prompt = _DEFAULT_REWRITE_QUESTION_PROMPT.format(history=history)
-            output = await self._llm_complete(
-                prompt, f"当前用户问题：{question}"
-            )
-            related, rewritten = self._parse_rewrite_result(output)
-        except Exception as e:
+        last_err = ""
+        for attempt in range(1, 3):  # 首次尝试 + 重试 1 次
+            try:
+                prompt = _DEFAULT_REWRITE_QUESTION_PROMPT.format(history=history)
+                output = await self._llm_complete(
+                    prompt, f"当前用户问题：{question}"
+                )
+                related, rewritten = self._parse_rewrite_result(output)
+                if not related:
+                    return question  # 判定为自包含问题，属正常结论，不重试
+                if rewritten and rewritten != current and rewritten != question:
+                    return rewritten
+                last_err = "LLM returned no effective rewrite"
+            except Exception as e:
+                last_err = str(e)
             logger.warning(
-                f"Rewrite followup question failed, keep original question: {e}"
+                f"Rewrite followup question attempt {attempt}/2 failed ({last_err}), retrying"
             )
-            return question
-        if (
-            not related
-            or not rewritten
-            or rewritten == current
-            or rewritten == question
-        ):
-            return question
-        return rewritten
+        logger.warning(
+            f"Rewrite followup question still failed after retry ({last_err}), "
+            f"keep original question"
+        )
+        return question
 
     async def _enumerate_field_values(
         self, connector, table_name: str, fields: List[str], limit: int
@@ -1144,13 +1176,12 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         self,
         question: str,
         keywords_text: str = "",
-        recalled_table_names: Optional[List[str]] = None,
     ) -> dict:
         """执行语义层流程（目录 -> 选表+关联 -> 加载字段 -> 字段确认 -> 全字段+值域枚举）。
 
-        供普通检索算子（map）与 Agent 版算子（map）共用。
+        供普通检索算子（map）使用；Agent 版算子（map）走独立的单轮流程
+        （含向量召回与合并校验），不复用本方法。
         keywords_text: 从问题提取的关键实体词文本，附加给选表 LLM 参考。
-        recalled_table_names: 从召回 SQL 注释中识别的来源表，加入允许表集合。
         """
         db_name = self._datasource._db_name
         dialect = self._datasource.dialect
@@ -1158,19 +1189,9 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         # 1. 全量轻目录（表名 + 注释，注释含业务语义与关联关系）
         catalog = await self._build_table_catalog()
 
-        # 2. LLM 选表 + 关联关系，并合并向量召回 SQL 注释中的来源表。
+        # 2. LLM 选表 + 关联关系
         selected = await self._select_tables(question, catalog, keywords_text)
         catalog_tables = {item.split(" -- ")[0] for item in catalog}
-        selected_names = {item["table"] for item in selected}
-        for table_name in recalled_table_names or []:
-            if table_name in catalog_tables and table_name not in selected_names:
-                relation = (
-                    "向量实体定位表；通过 table_name、column_name 和 raw_data 标识并关联来源业务表"
-                    if table_name == TARGET_TABLE
-                    else "向量召回命中的来源业务表"
-                )
-                selected.append({"table": table_name, "relation": relation})
-                selected_names.add(table_name)
         if selected:
             selected_text = "\n".join(
                 f"- {s['table']}"
@@ -1262,8 +1283,11 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
       2. 追问补全：结合会话历史（数据库 gpts_message 表，与 Agent 记忆同源），
          若当前问题指代前文（如"那环比是多少了"），
          改写为自包含的完整问题，避免漏选维度表、口径错乱；
-      3. 执行两阶段语义层（全表目录 -> LLM 选表+关联 -> 按选中表加载全字段）；
-      4. 把选好的表结构与用户问题一并写入消息内容（作为 user 消息），
+      3. 执行单轮语义层：全表目录 -> LLM 选表+关联，同时做关键词向量召回，
+         合并为候选集（LLM 自选 + 召回带入）后做一次"合并校验"（补缺失表 /
+         剔无关表 / 剔无意义召回），再确认值域字段并枚举真实取值；
+      4. 把最终允许表、完整表结构、保留的召回 SQL（含使用引导）与用户问题
+         一并写入消息内容（作为 user 消息），
          让下游 Agent（如 DataScientist）严格按语义层选出的表生成 SQL；
       5. 原样透传 AgentGenerateContext 给下游 AWEL Agent Operator。
 
@@ -1320,187 +1344,418 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         tags={"order": TAGS_ORDER_HIGH},
     )
 
-    async def _split_keywords_for_vector_recall(
-        self,
-        keywords: List[str],
-        table_names: List[str],
-        columns_by_table: dict,
-        value_fields_map: dict,
-    ) -> Tuple[Dict[str, List[dict]], List[str]]:
-        """在选中的原始业务表中模糊匹配关键词，并返回命中的表、字段和值。"""
-        connector = self._datasource.connector
-        searchable_fields = {}
-        for table_name in table_names:
-            if table_name == "dim_product_category":
-                real_fields = {
-                    column.get("name")
-                    for column in columns_by_table.get(table_name, [])
-                }
-                fields = [
-                    field
-                    for field in (
-                        "category_1",
-                        "category_2",
-                        "category_3",
-                        "category_4",
-                    )
-                    if field in real_fields
-                ]
-            else:
-                fields = value_fields_map.get(table_name) or [
-                    column.get("name")
-                    for column in columns_by_table.get(table_name, [])
-                    if any(
-                        marker in str(column.get("name") or "").lower()
-                        for marker in (
-                            "category",
-                            "product",
-                            "brand",
-                            "type",
-                            "name",
-                            "model",
-                        )
-                    )
-                ]
-            searchable_fields[table_name] = [field for field in fields if field]
+    # ---------------- V3.1 单轮语义层：向量召回 / 合并校验 辅助 ----------------
+    @staticmethod
+    def _parse_recall_items(recall_sql_list: List[str]) -> List[dict]:
+        """解析召回 SQL 首行注释（# 关键词:... 来自表 ...，主键 ...，命中列 ...）。
 
-        matched_evidence: Dict[str, List[dict]] = {}
-        unmatched = []
-        for keyword in keywords:
-            escaped_keyword = (
-                keyword.replace("\\", "\\\\")
-                .replace("'", "''")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
+        返回 [{sql, keyword, table, key_word, columns}]；注释格式无法解析的条目
+        保留原样（table 为空串），后续按"无法归表、不可随表剔除"处理。
+        """
+        items = []
+        for sql in recall_sql_list:
+            first_line = (sql.splitlines() or [""])[0]
+            match = re.match(
+                r"^\s*(?:#|--)\s*关键词[:：]\s*(.*?)\s*来自表\s+(\S+)\s*，主键\s+(\S+)\s*，命中列\s*(.+)$",
+                first_line,
             )
-            keyword_evidence = []
-            for table_name, fields in searchable_fields.items():
-                for field in fields:
-                    escaped_table = table_name.replace("`", "``")
-                    escaped_field = field.replace("`", "``")
-                    sql = (
-                        f"SELECT CAST(`{escaped_field}` AS STRING) AS matched_value "
-                        f"FROM `{escaped_table}` "
-                        f"WHERE CAST(`{escaped_field}` AS STRING) "
-                        f"LIKE '%{escaped_keyword}%' ESCAPE '\\\\' LIMIT 1"
-                    )
-                    try:
-                        rows = await self.blocking_func_to_async(connector.run, sql)
-                        # 第 1 行是列名，第 2 行才是首条实际命中值。
-                        if rows and len(rows) > 1:
-                            row = rows[1]
-                            matched_value = row[0] if row else ""
-                            keyword_evidence.append(
-                                {
-                                    "table_name": table_name,
-                                    "column_name": field,
-                                    "matched_value": str(matched_value or ""),
-                                }
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            "LIKE check failed for %s.%s: %s", table_name, field, e
-                        )
-            if keyword_evidence:
-                matched_evidence[keyword] = keyword_evidence
+            if match:
+                keyword, table, key_word, columns = match.groups()
+                items.append(
+                    {
+                        "sql": sql,
+                        "keyword": keyword.strip(),
+                        "table": table.strip(),
+                        "key_word": key_word.strip(),
+                        "columns": columns.strip(),
+                    }
+                )
             else:
-                unmatched.append(keyword)
-        return matched_evidence, unmatched
+                items.append(
+                    {
+                        "sql": sql,
+                        "keyword": "",
+                        "table": "",
+                        "key_word": "",
+                        "columns": "",
+                    }
+                )
+        return items
+
+    async def _vector_recall(self, keywords: List[str]) -> List[dict]:
+        """step4 向量召回：按关键词对 category_embedding 做语义召回，SQL 带 1 起固定序号。
+
+        固定序号贯穿后续"合并校验（drop_recalls 点名剔除）"与"保留召回 SQL"两步，
+        避免两步错位。召回模块异常或解析失败时返回空列表，不阻塞主流程。
+        """
+        if not keywords:
+            return []
+        try:
+            recall_results = await self.blocking_func_to_async(
+                recall_many, keywords, DEFAULT_MAX_DISTANCE
+            )
+        except Exception as e:
+            logger.warning(f"Vector recall failed, skip: {e}")
+            return []
+        recall_sql_list = []
+        for recall_result in recall_results:
+            recall_sql_list.extend(recall_result.get("sql", []))
+        items = self._parse_recall_items(recall_sql_list)
+        for idx, item in enumerate(items, start=1):
+            item["idx"] = idx
+        return items
+
+    @staticmethod
+    def _build_recall_rows_text(
+        recall_items: List[dict], catalog_comments: dict
+    ) -> str:
+        """把召回清单渲染成"序号. 关键词；来源表（表注释）；命中列"文本，供合并校验逐条审核。"""
+        rows = []
+        for item in recall_items:
+            table = item.get("table") or ""
+            comment = catalog_comments.get(table, "") if table else ""
+            table_desc = table if not comment else f"{table}（{comment}）"
+            rows.append(
+                f"{item.get('idx', '?')}. 关键词：{item.get('keyword') or '未知'}；"
+                f"来源表：{table_desc or '未知'}；命中列：{item.get('columns') or '未知'}"
+            )
+        return "\n".join(rows)
+
+    @staticmethod
+    def _parse_merge_verify_result(text: str) -> dict:
+        """解析合并校验输出，返回 {"missing_tables": [...], "drop_tables": [...], "drop_recalls": set}。"""
+        data = HOSchemaLinkingRetrieverOperator._parse_json_strict(text)
+        missing_tables = []
+        for item in data.get("missing_tables") or []:
+            name = item if isinstance(item, str) else None
+            if name is None and isinstance(item, dict):
+                name = item.get("table")
+            if name and str(name) not in missing_tables:
+                missing_tables.append(str(name))
+        drop_tables = []
+        for item in data.get("drop_tables") or []:
+            name = str(item or "").strip()
+            if name and name not in drop_tables:
+                drop_tables.append(name)
+        drop_recalls = set()
+        for item in data.get("drop_recalls") or []:
+            if isinstance(item, (int, float)):
+                drop_recalls.add(int(item))
+        return {
+            "missing_tables": missing_tables,
+            "drop_tables": drop_tables,
+            "drop_recalls": drop_recalls,
+        }
+
+    async def _run_table_verify(
+        self,
+        question: str,
+        candidate_names: List[str],
+        selected_names: List[str],
+        recall_items: List[dict],
+        catalog: List[str],
+        catalog_comments: dict,
+        columns_by_table: dict,
+    ) -> dict:
+        """step9a 表级校验（LLM）：补缺失表/剔无关表；失败自动重试 1 次，仍失败抛异常由调用方降级。"""
+        selected_set = set(selected_names)
+        recall_set = {item.get("table") for item in recall_items if item.get("table")}
+        schema_lines = []
+        for table in candidate_names:
+            cols = columns_by_table.get(table, [])
+            col_names = ", ".join(c.get("name", "") for c in cols)
+            comment = catalog_comments.get(table, "")
+            if table in selected_set:
+                origin = "LLM自选"
+            elif table in recall_set:
+                origin = "向量召回带入"
+            else:
+                origin = "兜底"
+            schema_lines.append(f"{table} -- {comment}（{origin}；字段：{col_names}）")
+        prompt = _DEFAULT_TABLE_VERIFY_PROMPT.format(
+            question=question,
+            selected_schemas="\n".join(schema_lines),
+            table_catalog="\n".join(f"- {item}" for item in catalog),
+        )
+        last_err = ""
+        for attempt in range(1, 3):
+            try:
+                output = await self._llm_complete(prompt, f"用户问题：{question}")
+                return self._parse_merge_verify_result(output)
+            except Exception as e:
+                last_err = str(e)
+                logger.warning(f"Table verify attempt {attempt}/2 failed: {last_err}")
+        raise RuntimeError(f"Table verify failed after retry: {last_err}")
+
+    async def _run_recall_verify(
+        self,
+        question: str,
+        allowed_tables: List[str],
+        recall_items: List[dict],
+        catalog_comments: dict,
+    ) -> dict:
+        """step9b 召回审核（LLM）：按序号剔无意义召回；失败自动重试 1 次，仍失败抛异常由调用方降级。"""
+        prompt = _DEFAULT_RECALL_VERIFY_PROMPT.format(
+            question=question,
+            allowed_tables=(
+                "\n".join(f"- {t}" for t in allowed_tables) or "（无允许表）"
+            ),
+            recall_rows=(
+                self._build_recall_rows_text(recall_items, catalog_comments)
+                or "（无向量召回）"
+            ),
+        )
+        last_err = ""
+        for attempt in range(1, 3):
+            try:
+                output = await self._llm_complete(prompt, f"用户问题：{question}")
+                return self._parse_merge_verify_result(output)
+            except Exception as e:
+                last_err = str(e)
+                logger.warning(f"Recall verify attempt {attempt}/2 failed: {last_err}")
+        raise RuntimeError(f"Recall verify failed after retry: {last_err}")
 
     async def map(self, input_value: AgentGenerateContext) -> AgentGenerateContext:
-        """执行语义层并把选表结果注入用户消息，然后原样透传。"""
+        """单轮语义层：选表+校验后把最终表结构与保留的召回 SQL 注入用户消息原样透传。
+
+        流程 step1-14：取问题→追问补全→提关键词→向量召回→全表目录→LLM 选表+关联→
+        组候选→加载全字段→9a 表级校验(剔/补)→9b 召回审核(剔无用)→9.5 绑定规则+定表→
+        10-12 值域字段确认/过滤/校验补→13 拼表结构+召回使用引导→14 组装 user 消息。
+        """
         if not input_value.message:
             raise ValueError("The message is empty.")
         question = input_value.message.content or ""
-        # 追问补全：结合历史对话，把"那环比是多少了"这类指代问题改写为
-        # "咖啡机Q1销量环比上季度"的完整问题，避免漏选品类表、口径错乱
+
+        # step2 追问补全：把指代前文的半截话改写为自包含完整问题（有历史时才触发 LLM）
         question = await self._rewrite_followup_question(question, input_value)
-        # 关键词提取后执行向量召回；召回模块只返回带来源注释的 SQL。
+
+        # step3 关键词提取：抽实体词（品类/品牌/观点词），供召回与选表参考
         keywords = await self._extract_keywords(question)
         keywords_text = "、".join(keywords) if keywords else ""
         logger.info(f"schema_linking extracted keywords: {keywords}")
 
-        # 先保持原 Schema Linking 流程完成选表，再查询这些原始业务表的真实字段。
-        result = await self._run_schema_linking(
-            question,
-            keywords_text=keywords_text,
+        # step4 向量召回：每条带固定序号，后续校验按序号剔（drop_recalls）
+        recall_items = await self._vector_recall(keywords)
+        if recall_items:
+            logger.info(
+                "Vector recall got %d sqls: %s",
+                len(recall_items),
+                [f"{i['idx']}. {i['table']}/{i['columns']}" for i in recall_items],
+            )
+
+        # step5 全量轻目录（表名+注释，注释含业务语义与关联关系）
+        catalog = await self._build_table_catalog()
+        catalog_tables = {item.split(" -- ")[0] for item in catalog}
+        catalog_comments = self._build_catalog_comments(catalog)
+
+        # step6 LLM 选表+关联（关键实体词一并给 LLM 参考）
+        selected = await self._select_tables(question, catalog, keywords_text)
+        selected_names = []
+        for item in selected:
+            name = item["table"]
+            if (
+                name
+                and name != TARGET_TABLE
+                and name in catalog_tables
+                and name not in selected_names
+            ):
+                selected_names.append(name)
+        logger.info(f"schema_linking LLM selected tables: {selected_names}")
+
+        # step7 组候选 = LLM 自选 + 召回来源表（recall_only）；category_embedding 永不进候选/允许表
+        candidate_names = list(selected_names)
+        recall_only_names = []
+        for item in recall_items:
+            table = item.get("table") or ""
+            if not table or table == TARGET_TABLE or table not in catalog_tables:
+                continue
+            if table not in candidate_names:
+                candidate_names.append(table)
+                recall_only_names.append(table)
+        if not candidate_names:
+            logger.warning("No valid tables selected, fallback to catalog tables")
+            candidate_names = [
+                t for t in catalog_tables if t != TARGET_TABLE
+            ][: self._max_selected_tables]
+
+        # step8 加载候选表完整字段（类型/主键/注释）
+        connector = self._datasource.connector
+        columns_by_table = {}
+        for table in candidate_names:
+            columns_by_table[table] = await self._get_columns_with_fallback(
+                connector, table
+            )
+
+        # step9a 表级校验：剔无关表/补缺失表（失败内部已重试，仍失败降级为只留 LLM 自选表）
+        table_actions = {"missing_tables": [], "drop_tables": []}
+        try:
+            table_actions = await self._run_table_verify(
+                question,
+                candidate_names,
+                selected_names,
+                recall_items,
+                catalog,
+                catalog_comments,
+                columns_by_table,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Table verify failed, degrade to LLM-selected tables only: {e}"
+            )
+            # 保守降级：只信 step6 的 LLM 自选表，recall_only 表全部出局
+            table_actions = {
+                "missing_tables": [],
+                "drop_tables": list(recall_only_names),
+            }
+
+        # 应用表级动作 → drop_names / missing_tables
+        drop_names = {
+            t
+            for t in table_actions["drop_tables"]
+            if t and t != TARGET_TABLE and t in candidate_names
+        }
+        missing_tables = [
+            t
+            for t in table_actions["missing_tables"]
+            if t
+            and t != TARGET_TABLE
+            and t in catalog_tables
+            and t not in candidate_names
+        ]
+        if drop_names:
+            logger.info(f"Table verify dropped tables: {sorted(drop_names)}")
+        # 中间允许表 = 候选 - 表级剔除 + 补充表，作为 step9b 召回审核的口径参照
+        allowed_names = [t for t in candidate_names if t not in drop_names]
+        allowed_names.extend(missing_tables)
+
+        # step9b 召回审核：按序号剔无意义召回（失败内部已重试，仍失败只留 LLM 自选表的召回）
+        recall_actions = {"drop_recalls": set()}
+        try:
+            recall_actions = await self._run_recall_verify(
+                question,
+                allowed_names,
+                recall_items,
+                catalog_comments,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Recall verify failed, drop recalls of non-LLM-selected tables: {e}"
+            )
+            selected_set = set(selected_names)
+            recall_actions = {
+                "drop_recalls": {
+                    item["idx"]
+                    for item in recall_items
+                    if item.get("table") and item["table"] not in selected_set
+                }
+            }
+        if recall_actions["drop_recalls"]:
+            logger.info(
+                "Recall verify dropped recall ids: %s",
+                sorted(recall_actions["drop_recalls"]),
+            )
+
+        # step9.5 绑定规则：recall_only 表召回全部被剔 → 出局
+        for table in recall_only_names:
+            recall_idx = [
+                item["idx"] for item in recall_items if item.get("table") == table
+            ]
+            if recall_idx and all(
+                i in recall_actions["drop_recalls"] for i in recall_idx
+            ):
+                drop_names.add(table)
+
+        # step9.5 最终允许表 = 中间允许表 - 出局表 + 补充表；补充表此刻补加载字段
+        final_names = [t for t in allowed_names if t not in drop_names]
+        for table in final_names:
+            if table not in columns_by_table:
+                columns_by_table[table] = await self._get_columns_with_fallback(
+                    connector, table
+                )
+        columns_by_table = {
+            table: columns_by_table[table]
+            for table in final_names
+            if table in columns_by_table
+        }
+
+        # 保留的召回 SQL：未被 drop_recalls 点名 且 其来源表 ∈ final_tables（同生共死）
+        kept_items = []
+        for item in recall_items:
+            if item.get("idx") in recall_actions["drop_recalls"]:
+                continue
+            table = item.get("table") or ""
+            if table and table not in final_names:
+                continue
+            kept_items.append(item)
+        if kept_items:
+            logger.info(
+                "Keep %d recall sqls: %s",
+                len(kept_items),
+                [f"{i['idx']}. {i['table']}/{i['columns']}" for i in kept_items],
+            )
+
+        # 按最终允许表重算 selected_text，避免被剔表残留在提示词里
+        relation_by_table = {}
+        for item in selected:
+            name = item["table"]
+            if name in final_names:
+                relation_by_table[name] = item.get("relation") or ""
+        for table in final_names:
+            if table in relation_by_table:
+                continue
+            if table in recall_only_names:
+                relation_by_table[table] = (
+                    "向量召回命中的来源业务表：可按召回 SQL 输出的主键值做实体过滤/关联"
+                )
+            else:
+                relation_by_table[table] = ""
+        for table in missing_tables:
+            relation_by_table[table] = "合并校验补充：用于表达问题中缺失的过滤维度"
+        if final_names:
+            selected_text = "\n".join(
+                f"- {table}"
+                + (
+                    f" -- 关联: {relation_by_table[table]}"
+                    if relation_by_table.get(table)
+                    else ""
+                )
+                for table in final_names
+            )
+        else:
+            selected_text = "- (无可用表)"
+
+        # step10-12 值域字段：确认 -> 过滤编造列名 -> 查真实取值校验并补字段
+        value_fields_map = await self._select_value_fields(question, columns_by_table)
+        value_fields_map = self._filter_value_fields(value_fields_map, columns_by_table)
+        value_fields_map = await self._verify_and_fix_value_fields(
+            question, columns_by_table, value_fields_map
         )
 
-        recall_sql_list = []
-        matched_evidence: Dict[str, List[dict]] = {}
-        recall_keywords = []
-        if keywords:
-            try:
-                matched_evidence, recall_keywords = (
-                    await self._split_keywords_for_vector_recall(
-                        keywords,
-                        result["table_names"],
-                        result["columns_by_table"],
-                        result["value_fields_map"],
-                    )
-                )
-                logger.info(
-                    "schema_linking source-table LIKE matched evidence: %s, "
-                    "LIKE unmatched keywords: %s; all keywords use vector recall",
-                    matched_evidence,
-                    recall_keywords,
-                )
-                recall_results = await self.blocking_func_to_async(
-                    recall_many, keywords, DEFAULT_MAX_DISTANCE
-                )
-                for recall_result in recall_results:
-                    recall_sql_list.extend(recall_result.get("sql", []))
-            except Exception as e:
-                logger.warning(f"Keyword LIKE check or vector recall failed, skip: {e}")
-
-        # SQL 首行注释格式为“# 关键词:... 来自表 ...，主键 ...”，从中提取来源表。
-        recalled_tables = []
-        for recall_sql in recall_sql_list:
-            match = re.search(r"来自表\s+([^，\s]+)", recall_sql)
-            if match and match.group(1) not in recalled_tables:
-                recalled_tables.append(match.group(1))
-
-        # 向量 SQL 会直接引用向量表；有召回 SQL 时，将向量表及命中的来源业务表
-        # 一并加入允许表集合并加载完整结构。
-        if recall_sql_list and TARGET_TABLE not in recalled_tables:
-            recalled_tables.append(TARGET_TABLE)
-        if recalled_tables:
-            result = await self._run_schema_linking(
-                question,
-                keywords_text=keywords_text,
-                recalled_table_names=recalled_tables,
-            )
-        keyword_filter_context = ""
-        if matched_evidence:
-            evidence_lines = []
-            for keyword, evidence_items in matched_evidence.items():
-                evidence_lines.append(f"- 关键词：{keyword}")
-                for item in evidence_items:
-                    evidence_lines.append(
-                        "  - 表：{table_name}；字段：{column_name}；命中值：{matched_value}".format(
-                            **item
-                        )
-                    )
-            keyword_filter_context += (
-                "\n\n原始业务表中的普通模糊匹配证据（LIKE '%关键词%'）：\n"
-                + "\n".join(evidence_lines)
-            )
-        if recall_keywords:
-            keyword_filter_context += (
-                "\n\n原始业务表中未直接模糊匹配的关键词：\n"
-                + "、".join(recall_keywords)
-            )
-        if recall_sql_list:
-            keyword_filter_context += (
-                "\n\n所有关键词对应的完整向量召回 SQL：\n"
-                + "\n\n".join(recall_sql_list)
+        # step13 拼装完整表结构（含真实取值参考）+ 保留召回 SQL 使用引导
+        schemas_text = await self._build_schemas_text(
+            final_names, catalog_comments, columns_by_table, value_fields_map
+        )
+        recall_context = ""
+        if kept_items:
+            # 精简版"使用引导"：仅在有保留召回时出现；无召回/召回全剔时整段不进入提示词
+            recall_context = (
+                "\n\n关键词向量召回 SQL 使用说明：\n"
+                "每段召回 SQL 会把问题中的实体词（品类/品牌/观点等）在内部向量表 "
+                "category_embedding 中按语义相似命中来源业务表的行，并输出这些行的标识列"
+                "（主键）真实取值，用于翻译成 WHERE/关联条件；不要改动其中的向量距离阈值与子查询。\n"
+                "标识列为单列主键：结果可直接用于 IN 过滤或按该主键关联；"
+                "为多列复合主键（逗号分隔）：必须逐列分别匹配"
+                "（AND t.a = r.a AND t.b = r.b ...），禁止把整串当单个列名。\n"
+                "category_embedding 是内部向量表，禁止在业务 SQL 中直接查询/关联。\n\n"
+                "关键词向量召回来源 SQL：\n"
+                + "\n\n".join(item["sql"] for item in kept_items)
             )
 
-        # 允许表 = Schema Linking 选中的表 + 召回 SQL 注释中的来源表。
+        # step14 组装 user 消息：允许表 + 完整表结构 + 召回来源 SQL + 用户问题
         input_value.message.content = (
-            f"允许使用的表及表间关联关系:\n{result['selected_text']}\n\n"
-            f"允许使用表的完整表结构（字段、类型、主键、注释）:\n{result['schemas_text']}"
-            f"{keyword_filter_context}\n\n"
+            f"允许使用的表及表间关联关系:\n{selected_text}\n\n"
+            f"允许使用表的完整表结构（字段、类型、主键、注释）:\n{schemas_text}"
+            f"{recall_context}\n\n"
             f"用户问题:\n{question}"
         )
         return input_value

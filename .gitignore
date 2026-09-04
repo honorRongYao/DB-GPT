@@ -216,3 +216,6 @@ docs/superpowers/
 # 旧前端备份目录
 web_bak_old/
 .gstack/
+
+# 测试上传的数据文件
+python_uploads/
