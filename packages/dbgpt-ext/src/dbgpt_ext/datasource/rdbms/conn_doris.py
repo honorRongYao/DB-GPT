@@ -270,7 +270,7 @@ class DorisConnector(RDBMSConnector):
             text(
                 f"SELECT TABLE_COMMENT "
                 f"FROM information_schema.tables "
-                f"where TABLE_NAME={table_name} and TABLE_SCHEMA=database()"
+                f"where TABLE_NAME='{table_name}' and TABLE_SCHEMA=database()"
             )
         )
         table_comment = cursor.fetchone()
