@@ -1304,7 +1304,14 @@ class ConversableAgent(Role, Agent):
             if context:
                 prompt_param.update(context)
             if self.bind_prompt.template_format == "f-string":
-                system_prompt = self.bind_prompt.format(**prompt_param)
+                try:
+                    system_prompt = self.bind_prompt.format(**prompt_param)
+                except KeyError:
+                    # StrictFormatter 会因模板未使用全部注入参数(out_schema/response等)
+                    # 而抛 KeyError。自定义精简提示词常故意不引用这些变量，这里放宽
+                    # "未用参数"校验后重试；占位符/花括号等其它解析检查仍保留。
+                    self.bind_prompt.template_is_strict = False
+                    system_prompt = self.bind_prompt.format(**prompt_param)
             elif self.bind_prompt.template_format == "jinja2":
                 # Render in a sandbox: bind_prompt.template may contain
                 # user-controlled content (e.g. a selected skill's instructions),

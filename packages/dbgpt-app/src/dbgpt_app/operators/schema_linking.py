@@ -655,8 +655,13 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         columns_by_table: dict,
         value_fields_map: dict,
     ) -> str:
-        """按选中表拼装完整表结构（字段/类型/主键/注释 + 值域枚举真实取值参考）。"""
+        """按选中表拼装完整表结构（字段/类型/主键/注释 + 表语义细节 + 值域枚举真实取值参考）。
+
+        细节（table_semantic.semantic）在表和字段都确认好之后才拼接，因此这里对
+        _run_schema_linking/agent 的最终 step13 两个调用点均处于确认完成阶段。
+        """
         connector = self._datasource.connector
+        semantics_map = await self._load_table_semantics(table_names)
         schemas = []
         for table_name in table_names:
             columns = columns_by_table.get(table_name, [])
@@ -693,6 +698,18 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                             + "\n"
                             + "\n".join(value_lines)
                         )
+            # 表语义细节：语义文本按行分行展示；只对确认后的选中表生效，未配置则跳过
+            semantic = semantics_map.get(table_name, "")
+            if semantic:
+                if len(semantic) > 8000:
+                    semantic = semantic[:8000].rstrip() + "\n(细节内容过长，已截断)"
+                detail_lines = [
+                    "    " + line for line in semantic.splitlines() if line.strip()
+                ]
+                schema += (
+                    f"\n\n***使用 {table_name}.units_month 生成SQL需要参考下面规范***\n"
+                    + "\n".join(detail_lines)
+                )
             schemas.append(schema)
         return "\n\n".join(schemas)
 
@@ -1170,6 +1187,43 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                     row_values.append(text)
             result.append(row_values)
         return result
+
+    async def _load_table_semantics(self, table_names: List[str]) -> dict:
+        """读取选中表的语义/约束细节，返回 {表名: 语义文本}。
+
+        语义表 table_semantic 中 `table` 列存表名、`semantic` 列存该表的约束细节
+        （如某字段如何计算、统计口径等）。该表不存在或查询失败时静默返回空 dict，
+        不影响主流程。
+        """
+        if not table_names:
+            return {}
+        connector = self._datasource.connector
+        try:
+            rows = await self.blocking_func_to_async(
+                connector.run,
+                "SELECT `table`, `semantic` FROM table_semantic",
+            )
+        except Exception as e:
+            logger.warning(f"Load table_semantic failed: {e}")
+            return {}
+        semantics = {}
+        wanted = set(table_names)
+        for row in rows:
+            if isinstance(row, dict):
+                t_name = row.get("table")
+                t_sem = row.get("semantic")
+            else:
+                # list/tuple 或 SQLAlchemy Row 对象；RDBMSConnector._query 会把列名
+                # 作为首行插入，首列等于表头名 "table" 的行视为表头跳过
+                try:
+                    if row[0] == "table":
+                        continue
+                    t_name, t_sem = row[0], row[1]
+                except (IndexError, TypeError, KeyError):
+                    continue
+            if t_name in wanted and t_sem:
+                semantics[str(t_name)] = str(t_sem)
+        return semantics
 
     # ---------------- 主流程 ----------------
     async def _run_schema_linking(
