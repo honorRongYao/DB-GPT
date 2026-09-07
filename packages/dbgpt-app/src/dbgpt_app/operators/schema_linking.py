@@ -45,6 +45,11 @@ logger = logging.getLogger(__name__)
 # 关键词提取后最多保留的实体词个数，防止一次问题提取过多词导致串行召回次数暴涨
 MAX_EXTRACT_KEYWORDS = 5
 
+# 语义层内部/配置表：不参与业务选表，永不进入目录与候选表。
+# table_semantic 存各表语义规范，仅由 _load_table_semantics 读取注入细节；
+# category_embedding(TARGET_TABLE) 是向量召回内部表。二者均非业务数据表。
+_INTERNAL_SKIP_TABLES = {TARGET_TABLE, "table_semantic"}
+
 _DEFAULT_SELECT_TABLE_PROMPT = """你是一个数据库专家，请为用户问题选出所需数据表，并说明表间关联关系。
 
 数据库 {db_name} 全部可用表目录（格式：表名 -- 表注释；注释含业务含义、字段说明及与其他表的关联关系，请仔细阅读）：
@@ -397,12 +402,15 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
     # ---------------- 1. 全量轻目录 ----------------
     async def _build_table_catalog(self) -> List[str]:
-        """列出全部可用表（表名 + 表注释，注释承载业务语义与关联关系，全量无截断）。"""
+        """列出全部可用表（表名 + 表注释，注释承载业务语义与关联关系，全量无截断）。
+        内部/配置表（table_semantic、category_embedding）在目录源头排除，不再参与选表。"""
         connector = self._datasource.connector
         table_names = await self.blocking_func_to_async(connector.get_table_names)
         table_names = list(table_names)
         catalog = []
         for table_name in table_names:
+            if table_name in _INTERNAL_SKIP_TABLES:
+                continue
             comment = ""
             try:
                 # 不同方言 get_table_comment 返回类型不一致，兼容 dict 和 str 两种
