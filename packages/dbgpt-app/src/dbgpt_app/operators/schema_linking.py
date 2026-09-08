@@ -715,7 +715,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                     "    " + line for line in semantic.splitlines() if line.strip()
                 ]
                 schema += (
-                    f"\n\n***使用 {table_name}.units_month 生成SQL需要参考下面规范***\n"
+                    f"\n\n***使用 {table_name} 生成SQL需要参考下面规范***\n"
                     + "\n".join(detail_lines)
                 )
             schemas.append(schema)

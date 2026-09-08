@@ -11,6 +11,7 @@ from dbgpt.core import (
     ModelRequest,
 )
 
+from ..core.action.base import ActionOutput
 from ..core.agent import AgentMessage
 from ..core.base_agent import ConversableAgent
 from ..core.profile import DynConfig, ProfileConfig
@@ -43,79 +44,20 @@ class DataScientistAgent(ConversableAgent):
         ),
         constraints=DynConfig(
             [
-                "Please ensure that the output is in the required format. "
-                "Please ensure that each analysis only outputs one analysis "
-                "result SQL, including as much analysis target content as possible.",
-                "If there is a recent message record, pay attention to refer to "
-                "the answers and execution results inside when analyzing, "
-                "and do not generate the same wrong answer.Please check carefully "
-                "to make sure the correct SQL is generated. Please strictly adhere "
-                "to the data structure definition given. The use of non-existing "
-                "fields is prohibited. Be careful not to confuse fields from "
-                "different tables, and you can perform multi-table related queries.",
-                "If the data and fields that need to be analyzed in the target are in "
-                "different tables, it is recommended to use multi-table correlation "
-                "queries first, and pay attention to the correlation between multiple "
-                "table structures.",
-                "It is prohibited to construct data yourself as query conditions. "
-                "Only the data values given by the famous songs in the input can "
-                "be used as query conditions.",
-                "The display_type field is only rendering metadata. Do not use it in "
-                "SQL reasoning, result validation, or the thought conclusion. Generate "
-                "the SQL first, execute it, and write the thought conclusion only from "
-                "the SQL and its real returned data. Supported display types: \n"
-                "{{ display_type }}",
-                "For overall SQL correctness, first identify the requested entities, "
-                "metrics, time range, grouping, ordering, ranking, and output fields. "
-                "Use only tables, columns, values, and relationships provided by the "
-                "resources or Schema Linking; never invent them. Preserve all explicit "
-                "user filters without splitting, shortening, rewriting, or replacing "
-                "them with synonyms. Use fact tables for metrics and dimension tables "
-                "for dimensions and key mapping. Before aggregation, verify the grain "
-                "and prevent one-to-many joins from causing duplicate counts. Use the "
-                "correct COUNT, COUNT DISTINCT, or SUM according to the question. "
-                "Implement TOP N, per-group ranking, trends, and changes in SQL with "
-                "LIMIT, window functions, LAG, or equivalent logic. If the user asks "
-                "for separate products, categories, or groups, keep the grouping fields "
-                "and do not merge them into a global result. When a question contains "
-                "multiple steps, preserve their semantic order and apply each filter, "
-                "time range, or ranking scope only to the step it modifies. For example, "
-                "a global TOP N followed by a period analysis must rank globally first "
-                "and apply the period only to the later analysis, unless the user explicitly "
-                "limits the ranking period. Interpret recent N periods from the actual "
-                "distinct period values in the fact table unless the user explicitly asks "
-                "for calendar-date calculation. Return every field required by the question "
-                "directly from SQL, including requested derived metrics such as trends, "
-                "differences, rates, rankings, or proportions. Before execution, verify "
-                "filters, their scope, joins, grain, aggregation, ordering, ranking, "
-                "derived metrics, and output fields.",
-                "For every sales calculation based on units_month, first apply the "
-                "category_id required by the question, then build a deduplicated monthly "
-                "sales dataset at the dt and parent_asin grain. Within the same category_id "
-                "and month, each parent_asin may retain only one asin. If multiple asin rows "
-                "exist for the same dt and parent_asin, keep the original row having the "
-                "greatest units_month and retain its asin; do not sum those asin rows. Use "
-                "ROW_NUMBER() OVER (PARTITION BY dt, parent_asin ORDER BY units_month DESC, "
-                "RAND()) and keep row number 1. If the greatest units_month is tied, select "
-                "one tied row randomly. This rule only defines dt and parent_asin "
-                "deduplication for monthly sales. Determine subsequent aggregation, ranking, "
-                "filtering, and output dimensions from the user's question.",
-                "For comment analysis, issue names for positive or negative feedback must "
-                "use only dwm_absa_comment_detail.cb_big_word. Do not use level_1, "
-                "level_2, level_3, or level_4 as issue names or issue grouping fields. "
-                "Comment sentiment must use only dwm_absa_comment_detail.sentiment. "
-                "For negative or positive feedback requests, filter by the actual negative "
-                "or positive values present in sentiment; never invent sentiment values. "
-                "When comparing multiple sentiments, group by cb_big_word and sentiment. "
-                "When only one sentiment is requested, group by cb_big_word and filter by "
-                "the corresponding sentiment value. By default, count mentions as distinct "
-                "comments with COUNT(DISTINCT comment_id); use COUNT(*) only when the user "
-                "explicitly asks for opinion fragments or labeling records. When the user "
-                "asks for the top N products by comment count and the top M issues for each "
-                "product, select the top N products first, join the labeling table by "
-                "comment_id, group by product and cb_big_word, and use a window function "
-                "to select the top M issues separately for each product. Do not merge them "
-                "into a global top M.",
+                "Generate exactly one complete and executable SQL statement in the "
+                "required output format.",
+                "Use only tables, columns, values, relationships, and business rules "
+                "provided in the resource information. Never invent them.",
+                "Determine filters, time range, grain, grouping, aggregation, ordering, "
+                "ranking, and output fields from the user's question. Prevent one-to-many "
+                "joins from causing duplicate counts.",
+                "Implement TOP N, per-group ranking, trends, differences, rates, and "
+                "proportions directly in SQL when requested. Preserve the semantic order "
+                "and scope of each step in multi-step questions.",
+                "The display_type field is rendering metadata only. Do not use it for SQL "
+                "reasoning or conclusions. The thought must objectively describe the SQL "
+                "calculation logic without inventing data conclusions. Supported display "
+                "types: \n{{ display_type }}",
             ],
             category="agent",
             key="dbgpt_agent_expand_dashboard_assistant_agent_profile_constraints",
@@ -248,6 +190,14 @@ class DataScientistAgent(ConversableAgent):
                     )
                     if not check_ok:
                         return False, check_reason
+                    await self._replace_result_summary(
+                        question=question,
+                        sql=sql,
+                        columns=columns,
+                        values=values,
+                        action_out=action_out,
+                        action_reply_obj=action_reply_obj,
+                    )
                 return True, None
         except Exception as e:
             logger.exception(f"DataScientist check exception！{str(e)}")
@@ -294,15 +244,9 @@ class DataScientistAgent(ConversableAgent):
             "为全局结果；检查‘最近N个周期’是否严格取事实表中最近N个不同周期；\n"
             "7. SQL 返回字段是否覆盖用户要求的全部维度、指标和计算结果；趋势、差值、变化率、"
             "排名或占比等派生指标如未在 SQL 中直接计算并返回，应判定不通过；\n"
-            "8. SQL 中的每个实体、过滤值、表、字段和关联是否能在资源或 Schema Linking "
-            "提供的信息中找到；禁止因结果非空就放过未提供的字段或关系；\n"
-            "9. thought 是否只基于 SQL 实际返回数据，未补充结果中不存在的数值或结论；\n"
-            "10. 凡涉及 units_month 的销量计算，是否先应用问题要求的 category_id，再按 "
-            "dt、parent_asin 去重；同一 category_id、同一月份下，一个 parent_asin 只能保留"
-            "一个 asin，应从相同 dt、parent_asin 的多个 asin 原始行中选出 units_month 最大"
-            "的一条并保留对应 asin，不得将这些 asin 的销量相加；最大值并列时应随机保留"
-            "其中一条。该规则只约束月销量数据的 dt、parent_asin 去重，后续分组、汇总、"
-            "排名和输出维度必须根据用户问题判断。\n"
+            "8. SQL 中的每个实体、过滤值、表、字段、关联和业务规则是否能在资源或 "
+            "Schema Linking 提供的信息中找到；禁止因结果非空就放过未提供的字段、关系或"
+            "违反资源中业务规则的计算逻辑。\n"
             "只输出严格 JSON：{\"pass\": true 或 false, \"reason\": \"不通过时必须明确指出"
             "问题点并给出修改方法（中文）；通过时 reason 留空字符串\"}"
         )
@@ -335,6 +279,79 @@ class DataScientistAgent(ConversableAgent):
         except Exception as e:
             logger.warning(f"LLM result check failed, skip: {e}")
         return True, None
+
+    async def _replace_result_summary(
+        self,
+        question: str,
+        sql: str,
+        columns: List[str],
+        values: List[Any],
+        action_out: ActionOutput,
+        action_reply_obj: dict,
+    ) -> None:
+        """Generate a concise conclusion from real query results for display."""
+        displayed_rows = action_reply_obj.get("data")
+        if not isinstance(displayed_rows, list):
+            displayed_rows = [dict(zip(columns, row)) for row in values]
+        row_count = int(action_reply_obj.get("count") or len(displayed_rows))
+        rows_preview = displayed_rows[:50]
+        user_question = question.rsplit("用户问题:\n", 1)[-1].strip()
+        sys_prompt = (
+            "你是严谨的数据分析总结专家。请根据用户问题、已执行 SQL 和真实查询结果，"
+            "生成面向用户的简洁中文分析结论。\n"
+            "规则：\n"
+            "1. 只能使用提供的真实结果，不得虚构、推测或补充结果中不存在的信息；\n"
+            "2. 直接回答用户问题，优先概括关键数值、排名、差异、趋势和异常；\n"
+            "3. 单值结果应明确说明指标值；多行结果应总结最重要发现，不要逐行复述；\n"
+            "4. 必须区分结果总行数与当前提供的预览行数；不得将预览误称为完整结果；\n"
+            "5. 不评价 SQL，不描述生成过程，不输出 Markdown 表格；\n"
+            "6. 只输出严格 JSON：{\"thought\": \"简洁、客观的中文分析结论\"}。"
+        )
+        human = (
+            f"用户问题：{user_question}\n\n"
+            f"已执行 SQL：\n{sql}\n\n"
+            f"结果总行数：{row_count}\n"
+            f"真实结果预览（最多50行）：\n"
+            f"{json.dumps(rows_preview, ensure_ascii=False, default=str)}"
+        )
+        try:
+            llm_client = self.not_null_llm_client
+            models = await llm_client.models()
+            if not models:
+                return
+            messages = [
+                ModelMessage(role=ModelMessageRoleType.SYSTEM, content=sys_prompt),
+                ModelMessage(role=ModelMessageRoleType.HUMAN, content=human),
+            ]
+            request = ModelRequest.build_request(models[0].model, messages=messages)
+            output = await llm_client.generate(request)
+            text = (output.text or "").strip()
+            start, end = text.find("{"), text.rfind("}")
+            if start == -1 or end <= start:
+                return
+            result = json.loads(text[start : end + 1])
+            thought = str(result.get("thought") or "").strip()
+            if not thought:
+                return
+
+            action_reply_obj["thought"] = thought
+            action_out.content = json.dumps(action_reply_obj, ensure_ascii=False)
+
+            chart = {
+                "display_type": action_reply_obj.get(
+                    "display_type", "response_table"
+                ),
+                "sql": sql,
+                "thought": thought,
+            }
+            import pandas as pd
+
+            action_out.view = await self.actions[0].render_protocol.display(
+                chart=chart,
+                data_df=pd.DataFrame(displayed_rows),
+            )
+        except Exception as e:
+            logger.warning(f"Replace result summary failed, keep original thought: {e}")
 
     async def _analyze_failed_result(
         self, question: str, sql: str, error_desc: str
