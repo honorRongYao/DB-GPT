@@ -505,6 +505,54 @@ async def get_chat_instance(dialogue: ConversationVo = Body()) -> BaseChat:
     return chat
 
 
+async def _sse_keepalive(agen, interval: int = 15):
+    """Wrap an SSE async generator with a keep-alive heartbeat.
+
+    Agent/flow pipelines (schema linking, multi-round SQL self-verification,
+    LLM failure attribution, etc.) can stay silent for a long time while an
+    LLM call runs. Without any bytes on the wire, browsers or reverse proxies
+    with a read timeout drop the SSE connection, which surfaces in the frontend
+    as "Sorry, We meet some error..." and in the backend as "Client
+    disconnected".
+
+    The inner generator is pumped by a background task; whenever it produces
+    nothing for ``interval`` seconds, an SSE comment frame (": keep-alive\\n\\n")
+    is emitted. Comment frames are ignored per the SSE spec, so the message
+    stream delivered to the frontend is unchanged.
+    """
+    queue: "asyncio.Queue" = asyncio.Queue(maxsize=1)
+    sentinel = object()
+    pump_done = asyncio.Event()
+
+    async def _pump():
+        try:
+            async for item in agen:
+                await queue.put(item)
+        finally:
+            try:
+                await queue.put(sentinel)
+            except asyncio.CancelledError:
+                pass
+            pump_done.set()
+
+    task = asyncio.create_task(_pump())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                if pump_done.is_set():
+                    break
+                yield ": keep-alive\n\n"
+                continue
+            if item is sentinel:
+                break
+            yield item
+    finally:
+        if not pump_done.is_set():
+            task.cancel()
+
+
 @router.post("/v1/chat/prepare")
 async def chat_prepare(
     dialogue: ConversationVo = Body(),
@@ -558,15 +606,17 @@ async def chat_completions(
             dialogue.ext_info.update({"incremental": dialogue.incremental})
             dialogue.ext_info.update({"temperature": dialogue.temperature})
             return StreamingResponse(
-                multi_agents.app_agent_chat(
-                    conv_uid=dialogue.conv_uid,
-                    chat_mode=dialogue.chat_mode,
-                    gpts_name=dialogue.app_code,
-                    user_query=dialogue.user_input,
-                    user_code=dialogue.user_name,
-                    sys_code=dialogue.sys_code,
-                    app_code=dialogue.app_code,
-                    **dialogue.ext_info,
+                _sse_keepalive(
+                    multi_agents.app_agent_chat(
+                        conv_uid=dialogue.conv_uid,
+                        chat_mode=dialogue.chat_mode,
+                        gpts_name=dialogue.app_code,
+                        user_query=dialogue.user_input,
+                        user_code=dialogue.user_name,
+                        sys_code=dialogue.sys_code,
+                        app_code=dialogue.app_code,
+                        **dialogue.ext_info,
+                    )
                 ),
                 headers=headers,
                 media_type="text/event-stream",
@@ -586,7 +636,11 @@ async def chat_completions(
                 incremental=dialogue.incremental,
             )
             return StreamingResponse(
-                flow_service.chat_stream_flow_str(dialogue.select_param, flow_req),
+                _sse_keepalive(
+                    flow_service.chat_stream_flow_str(
+                        dialogue.select_param, flow_req
+                    )
+                ),
                 headers=headers,
                 media_type="text/event-stream",
             )

@@ -579,6 +579,22 @@ class ConversableAgent(Role, Agent):
                     is_retry_chat=is_retry_chat,
                     current_retry_counter=current_retry_counter,
                 )
+                # 内部重试轮：把上一轮校验失败原因/改造建议注入给 LLM。
+                # 否则 fail_reason 只被 write_memories 落库，重新组装 messages 时
+                # 又不会带出（read_memories 返回空），导致每轮发给 LLM 的内容相同，
+                # 等于同一提示词随机重抽，无法针对错误修正。
+                if current_retry_counter > 0 and fail_reason:
+                    _retry_feedback = (
+                        "上一轮生成的 SQL 未通过执行/语义校验，请仔细阅读下面的"
+                        "失败原因与改造建议，重新生成修正后的 SQL，直接输出要求格式的 JSON。\n\n"
+                        f"【校验失败原因与改造建议】\n{fail_reason}"
+                    )
+                    thinking_messages.append(
+                        AgentMessage(
+                            content=_retry_feedback,
+                            role=ModelMessageRoleType.HUMAN,
+                        )
+                    )
                 with root_tracer.start_span(
                     "agent.generate_reply.thinking",
                     metadata={
@@ -707,6 +723,13 @@ class ConversableAgent(Role, Agent):
                         reply_message, sender, reviewer
                     )
                     is_success = check_pass
+                    # 每轮 verify 后立即按本轮成败同步 reply_message.success，
+                    # 使后续 send(reply_message) 落库时 is_success 与本轮校验一致：
+                    # - 失败且还有下一轮（L755 send）时记 is_success=0；
+                    # - LOOP 模式下"成功但不结束"继续下一轮时也先记成功，
+                    #   避免成功的中间轮被误记失败。
+                    # 最终成败仍在循环结束后由 L759 以 is_success 统一定稿。
+                    reply_message.success = check_pass
                     span.metadata["check_pass"] = check_pass
                     span.metadata["reason"] = reason
 

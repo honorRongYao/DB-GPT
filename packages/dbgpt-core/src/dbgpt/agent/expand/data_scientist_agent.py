@@ -44,20 +44,27 @@ class DataScientistAgent(ConversableAgent):
         ),
         constraints=DynConfig(
             [
-                "Generate exactly one complete and executable SQL statement in the "
-                "required output format.",
-                "Use only tables, columns, values, relationships, and business rules "
-                "provided in the resource information. Never invent them.",
-                "Determine filters, time range, grain, grouping, aggregation, ordering, "
-                "ranking, and output fields from the user's question. Prevent one-to-many "
-                "joins from causing duplicate counts.",
-                "Implement TOP N, per-group ranking, trends, differences, rates, and "
-                "proportions directly in SQL when requested. Preserve the semantic order "
-                "and scope of each step in multi-step questions.",
-                "The display_type field is rendering metadata only. Do not use it for SQL "
-                "reasoning or conclusions. The thought must objectively describe the SQL "
-                "calculation logic without inventing data conclusions. Supported display "
-                "types: \n{{ display_type }}",
+                "Please ensure that the output is in the required format. "
+                "Please ensure that each analysis only outputs one analysis "
+                "result SQL, including as much analysis target content as possible.",
+                "If there is a recent message record, pay attention to refer to "
+                "the answers and execution results inside when analyzing, "
+                "and do not generate the same wrong answer.Please check carefully "
+                "to make sure the correct SQL is generated. Please strictly adhere "
+                "to the data structure definition given. The use of non-existing "
+                "fields is prohibited. Be careful not to confuse fields from "
+                "different tables, and you can perform multi-table related queries.",
+                "If the data and fields that need to be analyzed in the target are in "
+                "different tables, it is recommended to use multi-table correlation "
+                "queries first, and pay attention to the correlation between multiple "
+                "table structures.",
+                "It is prohibited to construct data yourself as query conditions. "
+                "Only the data values given by the famous songs in the input can "
+                "be used as query conditions.",
+                "Please select an appropriate one from the supported display methods "
+                "for data display. If no suitable display type is found, "
+                "use 'response_table' as default value. Supported display types: \n"
+                "{{ display_type }}",
             ],
             category="agent",
             key="dbgpt_agent_expand_dashboard_assistant_agent_profile_constraints",
@@ -94,10 +101,15 @@ class DataScientistAgent(ConversableAgent):
             "display_type": self.actions[0].render_prompt(),
             "dialect": self.database.dialect,
         }
-        # AgentMessage.success 默认 True，会让"重试纠错反馈（Human 行）"和
-        # "未通过校验的中间回复（DS 行）"在写入 gpts_messages 时 is_success=1，
-        # 与真实校验结果不符。这里统一先置 False：中间消息如实记录 is_success=0，
-        # 最终成败由 base_agent.generate_reply 循环结束时按 verify 结果赋给最后一条消息。
+        # AgentMessage.success 默认 True，会让"重试纠错反馈（retry_message）"和
+        # "未通过校验的中间回复"在写入 gpts_messages 时 is_success=1，与真实校验结果不符。
+        # 这里仍先置 False：
+        # - retry_message（base_agent.generate_reply 每轮开头创建并 send）在本轮 verify
+        #   之前就会落库，只能靠这里保证 is_success=0；
+        # - reply_message 则保证首轮 verify 前的中间态不为成功。
+        # 每轮 verify 完成后，base_agent.generate_reply 会按 check_pass 覆盖同步
+        # reply_message.success（见 base_agent.py generate_reply），循环结束再由
+        # is_success 给最后一条消息统一定稿。
         reply_message.success = False
         return reply_message
 
