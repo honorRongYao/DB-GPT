@@ -101,11 +101,15 @@ class GptsMemory:
             return
         enable_vis_tag = self.enable_vis_message(conv_id=conv_id)
         if enable_vis_tag:
-            # 如果有临时消息内容需要push 拼接再最末尾，否则直接从短期记忆中发布最后消息
-            message_view = await self.app_link_chat_message(conv_id)
+            # VIS 协议下，逐 token 的"临时流文本帧"不再推送：
+            # - 这类帧会携带正在生成的原始文本（常含中间 SQL），不是过程"问题与解决"，
+            #   也不属于最终结果，与展示口径冲突；
+            # - 每个 token 都要重建并推送一次整帧，是 SSE 膨胀的主因之一。
+            # 阶段进度、消息落库（append_message）时仍会推送完整帧，交互不受影响。
             if temp_msg:
-                temp_view = await self.agent_stream_message(temp_msg)
-                message_view = message_view + "\n" + temp_view
+                return
+            # 直接从短期记忆中发布最后消息
+            message_view = await self.app_link_chat_message(conv_id)
             await queue.put(message_view)
 
         else:
@@ -231,7 +235,10 @@ class GptsMemory:
                     vis_items.append(await self._messages_to_plan_vis(plan_temps))
                     plan_temps = []
                     num = 0
-                    vis_items.append(await self._messages_to_agents_vis(value))
+                    # 无 goal 分组通常出现在队尾，其最后一条消息按"最终消息"完整展示
+                    vis_items.append(
+                        await self._messages_to_agents_vis(value, is_last_message=True)
+                    )
                 else:
                     # Skip the last plan item if it was a terminate action
                     if is_last and terminate_content:
@@ -240,7 +247,7 @@ class GptsMemory:
                     num += 1
                     plan_temps.append(
                         {
-                            "name": key,
+                            "name": self._compact_title(key),
                             "num": num,
                             "status": "complete",
                             "agent": value[0].receiver if value else "",
@@ -328,7 +335,7 @@ class GptsMemory:
             num = num + 1
             plan_items.append(
                 {
-                    "name": key,
+                    "name": self._compact_title(key),
                     "num": num,
                     "status": "complete",
                     "agent": value[0].receiver if value else "",
@@ -452,18 +459,47 @@ class GptsMemory:
     async def _messages_to_agents_vis(
         self, messages: List[GptsMessage], is_last_message: bool = False
     ):
+        """把消息列表渲染成 agent-messages 气泡帧。
+
+        展示口径（与产品确认）：
+        - 中间/失败/重试轮：不展示整段 SQL、图表与结果明细，只保留一句话说明
+          （thought 或执行错误，校验失败原因由紧随其后的文本消息给出）；
+        - 最终一条消息（is_last_message=True 时最后的气泡）：完整展示 view
+          （图/表 + 最终 SQL + 结论 thought）；
+        - 无 ActionReport 的文本（用户问题/语义层大文本/校验反馈）：裁剪，语义层注入
+          的大文本只保留末尾真正的"用户问题"部分。
+        裁剪只发生在"生成帧"这一步，不影响消息落库（messages_cache 仍是全量）。
+        """
         if messages is None or len(messages) <= 0:
             return ""
         messages_view = []
-        for message in messages:
+        last_idx = len(messages) - 1
+        for idx, message in enumerate(messages):
+            # 只有"真正校验通过的最后一条消息"才完整展示。重试过程中失败的中间轮
+            # 即使正好是队列末尾（is_last_message=True），也不得携带完整图表反复入帧。
+            is_final_msg = (
+                is_last_message
+                and idx == last_idx
+                and bool(getattr(message, "is_success", False))
+            )
             action_report_str = message.action_report
             view_info = message.content
             if action_report_str and len(action_report_str) > 0:
-                action_out = ActionOutput.from_dict(json.loads(action_report_str))
-                if action_out is not None:  # noqa
-                    if action_out.is_exe_success or is_last_message:  # noqa
+                try:
+                    action_out = ActionOutput.from_dict(json.loads(action_report_str))
+                except Exception:
+                    action_out = None
+                if action_out is not None:
+                    if is_final_msg and action_out.is_exe_success:
+                        # 最终成功消息：完整展示（图/表 + 最终 SQL + 结论）
                         view = action_out.view
                         view_info = view if view else action_out.content
+                    else:
+                        view_info = self._agent_bubble_summary(
+                            action_out, message.content
+                        )
+            else:
+                view_info = self._plain_text_display(message.content)
 
             messages_view.append(
                 {
@@ -479,6 +515,86 @@ class GptsMemory:
         return await vis_client.get(VisAgentMessages.vis_tag()).display(
             content=messages_view
         )
+
+    @classmethod
+    def _plain_text_display(cls, text: Optional[str], limit: int = 800) -> str:
+        """展示无 ActionReport 的文本气泡。
+
+        - 语义层注入的 user 消息很长（允许表 + 完整表结构 + 召回 SQL + 用户问题），
+          过程帧不需要这些中间产物，只保留末尾真正的"用户问题"；
+        - 校验失败原因、语义层阶段文本等较短，超长时裁剪首尾。
+        """
+        if not text:
+            return ""
+        content = str(text).strip()
+        if content.startswith("允许使用的表及表间关联关系"):
+            marker = "用户问题:\n"
+            idx = content.rfind(marker)
+            if idx != -1:
+                content = content[idx + len(marker) :].strip()
+        return cls._compact_display(content, limit)
+
+    @classmethod
+    def _agent_bubble_summary(
+        cls, action_out: ActionOutput, content: Optional[str], limit: int = 600
+    ) -> str:
+        """中间/失败轮次只给一句话说明，不携带 SQL、图表与结果明细。
+
+        执行失败轮：错误本身就是要看的原因；
+        执行成功但未过校验的中间轮：展示其 thought（若 JSON 可解析），否则给占位说明，
+        具体的"校验失败原因"由紧随其后的文本消息展示。
+        """
+        if action_out is not None and not action_out.is_exe_success:
+            err = action_out.content or content or "该步骤执行失败"
+            return cls._compact_display(str(err).strip(), limit)
+        thought = cls._extract_json_thought(content)
+        if thought:
+            return cls._compact_display(thought, limit)
+        return "（已生成并执行 SQL，正在进行结果校验…）"
+
+    @staticmethod
+    def _extract_json_thought(text: Optional[str]) -> Optional[str]:
+        """从 ActionOutput.content 的 JSON 里取出 thought 文本（不取 sql/data）。"""
+        if not text:
+            return None
+        try:
+            content = str(text)
+            start, end = content.find("{"), content.rfind("}")
+            if start == -1 or end <= start:
+                return None
+            obj = json.loads(content[start : end + 1])
+        except Exception:
+            return None
+        if isinstance(obj, dict):
+            thought = obj.get("thought")
+            if isinstance(thought, str) and thought.strip():
+                return thought.strip()
+        return None
+
+    @staticmethod
+    def _compact_title(text: Optional[str], limit: int = 160) -> str:
+        """计划卡条目标题过长时裁剪（如 current_goal 携带语义层大文本）。"""
+        if not text:
+            return ""
+        content = str(text).strip().replace("\n", " ")
+        if len(content) <= limit:
+            return content
+        return content[:limit] + "…"
+
+    @staticmethod
+    def _compact_display(text: Optional[str], limit: int = 1500) -> str:
+        """裁剪超长展示文本，只保留首尾，中间用省略说明代替。"""
+        if not text:
+            return ""
+        content = str(text)
+        if len(content) <= limit:
+            return content
+        head_len = int(limit * 0.6)
+        tail_len = int(limit * 0.35)
+        head = content[:head_len]
+        tail = content[-tail_len:]
+        omitted = len(content) - head_len - tail_len
+        return f"{head}\n……[中间省略 {omitted} 字符]……\n{tail}"
 
     async def _messages_to_plan_vis(self, messages: List[Dict]):
         if messages is None or len(messages) <= 0:

@@ -1,4 +1,4 @@
-"""使用 Doris 的 bge_embed 和 L2_DISTANCE 召回关键词并生成来源表 SQL。"""
+"""使用 Doris 的 bge_embed 和 inner_product_approximate 召回关键词并生成来源表 SQL。"""
 
 import os
 from typing import Dict, List, Set, Tuple
@@ -13,7 +13,7 @@ DORIS_PASSWORD = "dsdHHSA34."
 DATABASE = "voc_ai_test"
 TARGET_TABLE = "category_embedding"
 EMBEDDING_FUNCTION = "voc.bge_embed"
-DEFAULT_MAX_DISTANCE = 0.8
+DEFAULT_MAX_DISTANCE = 0.6
 
 
 def create_connection():
@@ -38,8 +38,8 @@ def quote_identifier(value: str) -> str:
 
 def build_distance_condition(query: str, max_distance: float) -> str:
     return (
-        f"L2_DISTANCE(`vector`, {EMBEDDING_FUNCTION}({sql_quote(query)})) "
-        f"< {max_distance}"
+        f"inner_product_approximate(`vector`, {EMBEDDING_FUNCTION}({sql_quote(query)})) "
+        f"> {max_distance}"
     )
 
 
