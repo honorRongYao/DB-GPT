@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple
 
 from dbgpt.agent import AgentGenerateContext
 from dbgpt.agent.core.memory.gpts.base import GptsMessage
+from dbgpt.agent.core.memory.gpts.gpts_memory import SEMANTIC_LAYER_GOAL
 from dbgpt.agent.resource.database import DBResource
 from dbgpt.core import (
     LLMClient,
@@ -1413,16 +1414,20 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         input_value: AgentGenerateContext,
         message: str,
         running: bool = False,
+        commit: bool = False,
     ) -> None:
-        """以 agent-plans 帧推送语义层阶段进度（与 DataScientist 同一 VIS 结构）。
+        """以 agent-plans 帧推送语义层“单条整卡”进度（与 DataScientist 同一 VIS 结构）。
 
-        running 帧只做"进行中"提示、不落缓存；complete 帧除推送进度帧外，还会把该
-        阶段以只读 GptsMessage 追加到本轮会话消息缓存（仅内存、不落库、不进入 LLM
-        上下文）。这样 DataScientist 的会话卡（app_link_chat_message 从缓存重建）会
-        保留语义层各阶段为先行条目，与后续"选表/SQL/结论"在同一张计划卡上持续展开，
-        不会出现中间卡片被整帧替换的断裂。
+        语义层各阶段不再各自占一行计划，而是合并成计划卡上的唯一一条
+        “[语义层]:正在查询语义层资料完成检索”（行内不放 agent-messages 气泡）：
+        - 调用点按 1~9 步流水线依次推 complete 帧，文字累积进整行 markdown，
+          markdown 里按推送顺序自动编号；running 帧只追加一行“进行中”提示；
+        - 最后一步（commit=True）时，把累积行以单条只读 GptsMessage 追加到本轮
+          会话消息缓存（仅内存、不落库、不进入 LLM 上下文）。这样 DataScientist
+          期间由 app_link_chat_message 重建的整帧里，计划卡仍只有这一条语义层整行，
+          用户问题/校验说明/最终结果则进入其下方消息区，不会出现中间卡片断裂。
 
-        阶段列表累积在 input_value._semlink_plan 上，随请求对象自然销毁。
+        进度行累积在 input_value._semlink_lines 上，随请求对象自然销毁。
         """
         try:
             agent_context = getattr(input_value, "agent_context", None)
@@ -1439,41 +1444,43 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             if not queue:
                 return
 
-            plan = getattr(input_value, "_semlink_plan", None)
-            if plan is None:
-                plan = []
-                setattr(input_value, "_semlink_plan", plan)
-            # 若上一项仍是 running（如"正在执行向量召回"），新一帧到来时应把它翻成
-            # 完成态后再追加新阶段，避免计划卡里残留一个永不结束的 running 项。
-            if plan and plan[-1].get("status") == "running" and not running:
-                plan.pop()
-            num = len(plan) + 1
+            lines = getattr(input_value, "_semlink_lines", None)
+            if lines is None:
+                lines = []
+                setattr(input_value, "_semlink_lines", lines)
+            if not running and message:
+                lines.append(message)
+            # 自动编号的单段落分行（用 <br/> 而非无序列表：前端把 markdown 列表每行
+            # 渲成行距很大的独立块，改用段落内换行后行距正常）；running 追加提示行。
+            # 每行前加不可断空格 \u00a0：避免段落以 "1. " 字面开头被解析成有序列表，
+            # 导致第 1 个序号被自动序号吞掉、与后续行样式不一致。
+            parts = [
+                f"\u00a0{idx}. {line}" for idx, line in enumerate(lines, start=1)
+            ]
+            if running and message:
+                parts.append(f"\u00a0{message}…")
+            # 整行状态：中途阶段仍视为进行中，只有最后一步（commit）才翻成 complete
+            status = "running" if (running or not commit) else "complete"
             item = {
-                "name": f"[DataScientist]:{message}",
-                "num": num,
-                "status": "running" if running else "complete",
-                "agent": "DataScientist",
-                "markdown": "```agent-messages\n"
-                + json.dumps(
-                    [
-                        {
-                            "sender": "DataScientist",
-                            "receiver": "?",
-                            "model": "",
-                            "markdown": message,
-                        }
-                    ],
-                    ensure_ascii=False,
-                )
-                + "\n```",
+                "name": SEMANTIC_LAYER_GOAL,
+                "num": 1,
+                "status": status,
+                "agent": "语义层",
+                "markdown": "<br/>".join(parts),
             }
-            plan.append(item)
+            frame_text = "```agent-plans\n" + json.dumps(
+                [item], ensure_ascii=False
+            ) + "\n```"
+            await queue.put(frame_text)
 
-            # 已完成阶段同步追加到会话消息缓存（仅本轮内存、不落库、不进入 LLM
-            # 上下文）。DataScientist 回合的会话卡由 app_link_chat_message 从该缓存
-            # 渲染，缓存里先有语义层各阶段、后有 DataScientist 消息，SSE 整帧替换时
-            # 前后就连续了；running 帧只提示"进行中"，跳过，不留下半截阶段。
-            if not running and conv_id in gpts_memory.messages_cache:
+            # 语义层收尾（commit）：把整行累积内容并入会话消息缓存（仅本轮内存、不
+            # 落库、不进 LLM 上下文），供 DataScientist 回合整帧重建时识别为“语义层折叠行”。
+            if (
+                commit
+                and not running
+                and lines
+                and conv_id in gpts_memory.messages_cache
+            ):
                 try:
                     gpts_memory.messages_cache[conv_id].append(
                         GptsMessage(
@@ -1481,19 +1488,14 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                             sender="DataScientist",
                             receiver="DataScientist",
                             role=ModelMessageRoleType.AI,
-                            content=message,
-                            current_goal=f"[DataScientist]:{message}",
+                            content="\n".join(lines),
+                            current_goal=SEMANTIC_LAYER_GOAL,
                         )
                     )
                 except Exception as e:
                     logger.warning(
                         f"Record schema linking stage message failed, ignore: {e}"
                     )
-
-            frame_text = "```agent-plans\n" + json.dumps(
-                plan, ensure_ascii=False
-            ) + "\n```"
-            await queue.put(frame_text)
         except Exception as e:
             logger.warning(f"Push schema linking stage plan failed, ignore: {e}")
 
@@ -1681,16 +1683,21 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
 
         # step2 追问补全：把指代前文的半截话改写为自包含完整问题（有历史时才触发 LLM）
         question = await self._rewrite_followup_question(question, input_value)
+        # step2 结束 -> 上报阶段进度（第 1 步：结合历史消息改写/补全用户提问）
+        await self._push_stage_text(
+            input_value, "结合历史消息改写用户提问（无历史指代时沿用原问题）"
+        )
 
         # step3 关键词提取：抽实体词（品类/品牌/观点词），供召回与选表参考
         keywords = await self._extract_keywords(question)
         keywords_text = "、".join(keywords) if keywords else ""
         logger.info(f"schema_linking extracted keywords: {keywords}")
-        # step3 结束 -> 上报阶段进度（与 Agent 消息相同的 vis 文本帧）
+        # step3 结束 -> 上报阶段进度（第 2 步：关键词提取）
         await self._push_stage_text(
             input_value,
-            f"语义层：正在分析问题，已提取 {len(keywords)} 个实体关键词"
-            + (f"（{keywords_text}）" if keywords_text else ""),
+            f"提取问题关键词（供召回与选表参考）：{keywords_text}"
+            if keywords_text
+            else "提取问题关键词：未提取到有效实体词（将仅依赖全表目录选表）",
         )
 
         # step4 向量召回：每条带固定序号，后续校验按序号剔（drop_recalls）
@@ -1698,7 +1705,7 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         # 避免前端长时间无任何输出。
         await self._push_stage_text(
             input_value,
-            "语义层：正在执行向量召回，匹配业务语义（可能需要几秒到十几秒）…",
+            "正在执行向量召回，匹配业务语义（可能需要几秒到十几秒）",
             running=True,
         )
         recall_items = await self._vector_recall(keywords)
@@ -1708,15 +1715,12 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                 len(recall_items),
                 [f"{i['idx']}. {i['table']}/{i['columns']}" for i in recall_items],
             )
-        # step4 结束 -> 上报阶段进度
+        # step4 结束 -> 上报阶段进度（第 3 步：向量召回结果）
         await self._push_stage_text(
             input_value,
-            "语义层：向量召回完成，"
-            + (
-                f"命中 {len(recall_items)} 条业务语义候选"
-                if recall_items
-                else "未命中任何候选，将仅依赖全表目录选表"
-            ),
+            f"向量召回：命中 {len(recall_items)} 条业务语义候选 SQL（作为选表与 WHERE 实体取值来源）"
+            if recall_items
+            else "向量召回：未命中任何候选，本次仅依赖全表目录选表",
         )
 
         # step5 全量轻目录（表名+注释，注释含业务语义与关联关系）
@@ -1737,11 +1741,12 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             ):
                 selected_names.append(name)
         logger.info(f"schema_linking LLM selected tables: {selected_names}")
-        # step6 结束 -> 上报阶段进度
+        # step6 结束 -> 上报阶段进度（第 4 步：全表目录 + AI 主动选表/关联）
         tables_txt = f"：{', '.join(selected_names)}" if selected_names else ""
         await self._push_stage_text(
             input_value,
-            f"语义层：选表完成，已确定 {len(selected_names)} 张候选表{tables_txt}",
+            f"列出全表目录并让 AI 主动选表：已确定 {len(selected_names)} 张候选表"
+            f"{tables_txt}，含表间关联关系",
         )
 
         # step7 组候选 = LLM 自选 + 召回来源表（recall_only）；category_embedding 永不进候选/允许表
@@ -1859,6 +1864,16 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             for table in final_names
             if table in columns_by_table
         }
+        # step9.5 结束 -> 上报阶段进度（第 5 步：候选表/召回来源表相关性校验）
+        dropped_txt = (
+            f"，剔除 {len(drop_names)} 张无关/不再适用的表" if drop_names else ""
+        )
+        missing_txt = f"，补充 {len(missing_tables)} 张缺失表" if missing_tables else ""
+        await self._push_stage_text(
+            input_value,
+            "候选表（LLM 自选 + 向量召回来源）校验：加载字段让大模型判定与问题相关性"
+            f"{dropped_txt}{missing_txt}，最终确定 {len(final_names)} 张可用表",
+        )
 
         # 保留的召回 SQL：未被 drop_recalls 点名 且 其来源表 ∈ final_tables（同生共死）
         kept_items = []
@@ -1875,13 +1890,21 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                 len(kept_items),
                 [f"{i['idx']}. {i['table']}/{i['columns']}" for i in kept_items],
             )
-        # step9 结束（表级校验 + 召回审核 + 绑定规则）-> 上报阶段进度
-        drop_txt = f"，剔除 {len(drop_names)} 张无关表" if drop_names else ""
-        await self._push_stage_text(
-            input_value,
-            f"语义层：表级校验与召回审核完成，最终确定 {len(final_names)} 张可用表"
-            f"{drop_txt}，保留 {len(kept_items)} 条召回 SQL",
-        )
+        # step9 结束（表级校验 + 召回审核 + 绑定规则）-> 上报阶段进度（第 6 步：召回 SQL 复核）
+        recall_total = len(recall_items)
+        if recall_total:
+            dropped_recall = recall_total - len(kept_items)
+            kept_txt = f"剔除 {dropped_recall} 条无用召回，" if dropped_recall else ""
+            await self._push_stage_text(
+                input_value,
+                f"召回 SQL 复核：共 {recall_total} 条候选召回，{kept_txt}"
+                f"保留 {len(kept_items)} 条可用（随表同留同删，供写 WHERE/关联）",
+            )
+        else:
+            await self._push_stage_text(
+                input_value,
+                "召回 SQL 复核：本次无召回 SQL，WHERE/关联条件按全表目录与表结构编写",
+            )
 
         # 按最终允许表重算 selected_text，避免被剔表残留在提示词里
         relation_by_table = {}
@@ -1916,9 +1939,34 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         # step10-12 值域字段：确认 -> 过滤编造列名 -> 查真实取值校验并补字段
         value_fields_map = await self._select_value_fields(question, columns_by_table)
         value_fields_map = self._filter_value_fields(value_fields_map, columns_by_table)
+        # step10 结束 -> 上报阶段进度（第 7 步：从保留表挑选关键字段）
+        sel_count = sum(len(v) for v in value_fields_map.values())
+        if sel_count:
+            await self._push_stage_text(
+                input_value,
+                f"从最终保留的表里挑选关键字段：共 {sel_count} 个（查真实取值辅助写对 WHERE）",
+            )
+        else:
+            await self._push_stage_text(
+                input_value,
+                "关键字段挑选：本次无需查询字段真实取值（可直接按表结构写 SQL）",
+            )
         value_fields_map = await self._verify_and_fix_value_fields(
             question, columns_by_table, value_fields_map
         )
+        # step11/12 结束 -> 上报阶段进度（第 8 步：关键字段真实值校验/补字段）
+        verified_count = sum(len(v) for v in value_fields_map.values())
+        if verified_count:
+            await self._push_stage_text(
+                input_value,
+                f"关键字段真实值校验：核对 {verified_count} 个字段的真实取值，"
+                "供大模型判断够不够用，不足自动补字段",
+            )
+        else:
+            await self._push_stage_text(
+                input_value,
+                "关键字段真实值校验：无字段需要核对真实取值",
+            )
 
         # step13 拼装完整表结构（含真实取值参考）+ 保留召回 SQL 使用引导
         schemas_text = await self._build_schemas_text(
@@ -1947,10 +1995,11 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             f"{recall_context}\n\n"
             f"用户问题:\n{question}"
         )
-        # step14 结束 -> 语义层收尾
+        # step14 结束 -> 语义层收尾（第 9 步：组合输出并注入，commit=True 才落缓存）
         await self._push_stage_text(
             input_value,
-            f"语义层完成：已注入 {len(final_names)} 张表的完整表结构与召回 SQL 引导，"
-            "交由数据分析 Agent 编写 SQL",
+            f"组合输出并注入：{len(final_names)} 张可用表结构 + 召回 SQL 引导 + "
+            "用户问题已组装完成，交由数据分析 Agent 编写 SQL",
+            commit=True,
         )
         return input_value

@@ -17,6 +17,9 @@ from .base import GptsMessage, GptsMessageMemory, GptsPlansMemory
 from .default_gpts_memory import DefaultGptsMessageMemory, DefaultGptsPlansMemory
 
 NONE_GOAL_PREFIX: str = "none_goal_count_"
+# 语义层折叠行的目标标题：语义层各阶段不再各占一行计划，而是合并成一条
+# “正在进行检索/选表”的整行；行内不放气泡，各阶段文字分行放在该行 markdown 中。
+SEMANTIC_LAYER_GOAL: str = "[语义层]:正在查询语义层资料完成检索"
 
 logger = logging.getLogger(__name__)
 
@@ -454,7 +457,76 @@ class GptsMemory:
                 )
             )
 
+        # 语义层折叠模式：缓存里存在单条“[语义层]”整行消息时，计划卡只保留这一条，
+        # 其余真实消息（用户问题/校验说明/最终结果）按原顺序进入下方消息区展示。
+        collapse_semlink = (not app_link_message) and any(
+            key == SEMANTIC_LAYER_GOAL for key in temp_group
+        )
+        if collapse_semlink:
+            return await self._semlink_collapsed_vis(temp_group, vis_items)
+
         return await self._message_group_vis_build(temp_group, vis_items)
+
+    async def _semlink_collapsed_vis(
+        self, temp_group: Dict, vis_items: list
+    ) -> str:
+        """语义层折叠模式的整帧组装：计划卡一行 + 消息区气泡。
+
+        - 计划卡：只保留“[语义层]:正在查询语义层资料完成检索”这一行，行内不放
+          agent-messages 气泡，各阶段文字分行放入 markdown；
+        - 消息区：语义层行之外的真实消息按缓存顺序渲染（用户问题裁剪为真问题、
+          最终成功消息完整展示图/表/SQL，失败的中间轮只给一句话原因）。
+        """
+        plan_lines: List[str] = []
+        other_messages: List[GptsMessage] = []
+        for key, value in temp_group.items():
+            if key == SEMANTIC_LAYER_GOAL:
+                for m in value:
+                    content = (m.content or "").strip()
+                    for line in content.splitlines():
+                        line = line.strip()
+                        if line:
+                            plan_lines.append(line)
+            else:
+                other_messages.extend(value)
+        if not plan_lines:
+            plan_lines.append("语义层：正在检索语义层资料、选表并注入表结构")
+
+        # 是否已产出“最终成功”消息：已成功 -> 整行收尾为 complete；执行中 -> running
+        done = False
+        if other_messages:
+            last = other_messages[-1]
+            if getattr(last, "is_success", False) and last.action_report:
+                try:
+                    action_out = ActionOutput.from_dict(
+                        json.loads(last.action_report)
+                    )
+                    done = bool(action_out and action_out.is_exe_success)
+                except Exception:
+                    done = True
+        plan_item = {
+            "name": SEMANTIC_LAYER_GOAL,
+            "num": 1,
+            "status": "complete" if done else "running",
+            "agent": "语义层",
+            # 行前加不可断空格，避免段落以 "1. " 开头被 markdown 解析成有序列表
+            "markdown": "<br/>".join(
+                f"\u00a0{idx}. {line}"
+                for idx, line in enumerate(plan_lines, start=1)
+            ),
+        }
+        if vis_items:
+            # 理论上前方不应有 app_link 类 vis 项（collapse 模式已排除），保险起见仍拼接
+            return "\n".join(vis_items) + "\n" + await self._messages_to_plan_vis(
+                [plan_item]
+            )
+        plan_vis = await self._messages_to_plan_vis([plan_item])
+        if not other_messages:
+            return plan_vis
+        msg_vis = await self._messages_to_agents_vis(
+            other_messages, is_last_message=True
+        )
+        return "\n".join(filter(None, [plan_vis, msg_vis]))
 
     async def _messages_to_agents_vis(
         self, messages: List[GptsMessage], is_last_message: bool = False
