@@ -14,7 +14,7 @@
 import json
 import logging
 import re
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from dbgpt.agent import AgentGenerateContext
 from dbgpt.agent.core.memory.gpts.base import GptsMessage
@@ -39,7 +39,12 @@ from dbgpt.core.awel.flow import (
 from dbgpt.model.operators import MixinLLMOperator
 from dbgpt.util.i18n_utils import _
 
-from .category_recall import DEFAULT_MAX_DISTANCE, TARGET_TABLE, recall_many
+from .category_recall import (
+    DEFAULT_MAX_DISTANCE,
+    TARGET_TABLE,
+    quote_identifier,
+    recall_many,
+)
 from .llm import HOContextBody
 
 logger = logging.getLogger(__name__)
@@ -561,9 +566,11 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             )
         logger.warning(
             f"Select tables still failed after retry ({last_err}), "
-            f"fallback to all tables"
+            f"fallback to first {self._max_selected_tables} tables"
         )
-        return self._fallback_all_tables(catalog)
+        # 兜底只取目录前 N 张：避免把全部表都加载字段、值域枚举后塞进提示词，
+        # 导致提示词超长（与普通检索版 _run_schema_linking 的兜底口径保持一致）
+        return self._fallback_all_tables(catalog)[: self._max_selected_tables]
 
     @staticmethod
     def _fallback_all_tables(catalog: List[str]) -> List[dict]:
@@ -605,9 +612,17 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         return result
 
     @staticmethod
-    def _parse_json_strict(text: str) -> dict:
-        """容错解析 LLM 输出的 JSON：兼容中文引号/冒号；整体失败则截取首个 { 到末个 } 再解析。"""
-        text = text.strip()
+    def _trim_to_json_object(text: str) -> str:
+        """截取首个 { 到末个 } 之间的内容；找不到合法区间时返回空串。"""
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return ""
+        return text[start : end + 1]
+
+    @staticmethod
+    def _sanitize_json_text(text: str) -> str:
+        """把 LLM 常见的中文标点/双花括号写法还原成合法 JSON 字符（仅在原文解析失败时使用）。"""
         text = (
             text.replace("“", '"')
             .replace("”", '"')
@@ -615,17 +630,48 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             .replace("’", "'")
             .replace("：", ":")
         )
-        # 兼容 LLM 把提示词示例的双花括号照抄进输出（{{ } } 成对出现时才还原）
+        # 兼容 LLM 把提示词示例的双花括号照抄进输出（{{ }} 成对出现时才还原）
         if "{{" in text:
             text = text.replace("{{", "{").replace("}}", "}")
-        try:
-            return json.loads(text)
-        except Exception:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                raise ValueError(f"Can not parse LLM output: {text}")
-            return json.loads(text[start : end + 1])
+        return text
+
+    @staticmethod
+    def _parse_json_strict(text: str) -> dict:
+        """容错解析 LLM 输出的 JSON，返回 dict。
+
+        优先按原文解析，只有原文解析失败时才启用容错手段（截取首个 { 到末个 }、
+        替换中文引号/冒号、还原双花括号）。这样可避免"字符串值里的中文标点被全局
+        替换"改坏合法 JSON——relation 等字段是中文自由文本，一旦出现中文引号，
+        无条件替换会让引号提前闭合、JSON 直接非法。
+        """
+        raw = (text or "").strip()
+        if not raw:
+            raise ValueError("Can not parse LLM output: empty text")
+
+        candidates = [raw]
+        trimmed = HOSchemaLinkingRetrieverOperator._trim_to_json_object(raw)
+        if trimmed and trimmed != raw:
+            candidates.append(trimmed)
+        sanitized = HOSchemaLinkingRetrieverOperator._sanitize_json_text(raw)
+        if sanitized != raw:
+            candidates.append(sanitized)
+            sanitized_trimmed = HOSchemaLinkingRetrieverOperator._trim_to_json_object(
+                sanitized
+            )
+            if sanitized_trimmed and sanitized_trimmed not in candidates:
+                candidates.append(sanitized_trimmed)
+
+        last_err: Optional[Exception] = None
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+            except Exception as e:
+                last_err = e
+                continue
+            if isinstance(data, dict):
+                return data
+            last_err = ValueError("Parsed JSON is not an object")
+        raise ValueError(f"Can not parse LLM output: {raw}") from last_err
 
     @staticmethod
     def _build_catalog_comments(catalog: List[str]) -> dict:
@@ -697,7 +743,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                         header = (
                             "    "
                             + "，".join(vf_list)
-                            + f" 取值（真实数据，前{len(rows)}行）:"
+                            + f" 最高频取值（真实数据，按出现频次降序，前{len(rows)}个）:"
                         )
                         value_lines = [
                             "    " + ", ".join(r) for r in rows
@@ -1149,20 +1195,37 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         )
         return question
 
+    @staticmethod
+    def _format_cell_value(value: Any) -> str:
+        """把取值渲染成展示文本：None→空串，超长截断到 20 字符。
+
+        dict/list 两种 connector 返回类型共用同一套渲染，避免两边行为不一致。
+        """
+        if value is None:
+            return ""
+        text = str(value)
+        return text[:20] + "..." if len(text) > 20 else text
+
     async def _enumerate_field_values(
         self, connector, table_name: str, fields: List[str], limit: int
     ) -> List[List[str]]:
-        """查询多个字段的前 N 行真实数据，供 LLM 写 WHERE 条件时参考。
+        """查询多个字段的"最高频真实取值"，供 LLM 写 WHERE 条件时参考。
 
-        直接取表的前 limit 行原始记录（不做聚合、不按频次排序），
+        按取值组合的出现频次降序列出前 limit 个（与参数"按频次降序取最常见取值"一致）：
+        SELECT f1, f2, COUNT(*) AS _cnt FROM t GROUP BY f1, f2 ORDER BY _cnt DESC LIMIT n。
+        表名与列名统一加反引号，兼容保留字/特殊字符标识符。
         返回行内各值顺序与 fields 一致，形如 [["其他配件", "生活家居配件", ...], ...]。
         空值显示为空字符串；查询失败（字段不存在、表不可读等）时静默返回空列表，不影响主流程。
         """
-        fields_sql = ", ".join(fields)
+        if not fields:
+            return []
+        fields_sql = ", ".join(quote_identifier(f) for f in fields)
         try:
             rows = await self.blocking_func_to_async(
                 connector.run,
-                f"SELECT {fields_sql} FROM {table_name} LIMIT {limit}",
+                f"SELECT {fields_sql}, COUNT(*) AS _cnt "
+                f"FROM {quote_identifier(table_name)} "
+                f"GROUP BY {fields_sql} ORDER BY _cnt DESC LIMIT {int(limit)}",
             )
         except Exception as e:
             logger.warning(
@@ -1172,7 +1235,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         result = []
         for row in rows:
             if isinstance(row, dict):
-                row_values = [str(row.get(f) or "") for f in fields]
+                values = [row.get(f) for f in fields]
             else:
                 # list/tuple 或 SQLAlchemy Row 对象（均支持索引访问）
                 try:
@@ -1182,20 +1245,18 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 # RDBMSConnector._query 会把列名作为首行插入（即 fields 列名），跳过该表头行
                 if first in fields:
                     continue
-                row_values = []
+                values = []
                 for i in range(len(fields)):
                     try:
-                        v = row[i]
+                        values.append(row[i])
                     except (IndexError, TypeError, KeyError):
-                        v = None
-                    if v is None:
-                        row_values.append("")
-                        continue
-                    text = str(v)
-                    if len(text) > 20:
-                        text = text[:20] + "..."
-                    row_values.append(text)
-            result.append(row_values)
+                        values.append(None)
+            result.append(
+                [
+                    HOSchemaLinkingRetrieverOperator._format_cell_value(v)
+                    for v in values
+                ]
+            )
         return result
 
     async def _load_table_semantics(self, table_names: List[str]) -> dict:
@@ -1239,13 +1300,11 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
     async def _run_schema_linking(
         self,
         question: str,
-        keywords_text: str = "",
     ) -> dict:
         """执行语义层流程（目录 -> 选表+关联 -> 加载字段 -> 字段确认 -> 全字段+值域枚举）。
 
         供普通检索算子（map）使用；Agent 版算子（map）走独立的单轮流程
-        （含向量召回与合并校验），不复用本方法。
-        keywords_text: 从问题提取的关键实体词文本，附加给选表 LLM 参考。
+        （含关键词提取与向量召回），不复用本方法，因此这里不接收关键词。
         """
         db_name = self._datasource._db_name
         dialect = self._datasource.dialect
@@ -1254,7 +1313,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         catalog = await self._build_table_catalog()
 
         # 2. LLM 选表 + 关联关系
-        selected = await self._select_tables(question, catalog, keywords_text)
+        selected = await self._select_tables(question, catalog)
         catalog_tables = {item.split(" -- ")[0] for item in catalog}
         if selected:
             selected_text = "\n".join(
@@ -1801,14 +1860,23 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             for t in table_actions["drop_tables"]
             if t and t != TARGET_TABLE and t in candidate_names
         }
-        missing_tables = [
-            t
-            for t in table_actions["missing_tables"]
-            if t
-            and t != TARGET_TABLE
-            and t in catalog_tables
-            and t not in candidate_names
-        ]
+        # 补表受 _max_selected_tables 约束（最终表数 = 候选保留数 + 补表数）：
+        # 避免 LLM 一次补过多表，导致字段加载次数与提示词长度失控
+        kept_count = len([t for t in candidate_names if t not in drop_names])
+        missing_quota = max(0, self._max_selected_tables - kept_count)
+        missing_tables = []
+        for t in table_actions["missing_tables"]:
+            if not t or t == TARGET_TABLE or t not in catalog_tables:
+                continue
+            if t in candidate_names or t in missing_tables:
+                continue
+            if len(missing_tables) >= missing_quota:
+                logger.info(
+                    f"Missing tables exceed max_selected_tables="
+                    f"{self._max_selected_tables}, ignore rest: {t}"
+                )
+                break
+            missing_tables.append(t)
         if drop_names:
             logger.info(f"Table verify dropped tables: {sorted(drop_names)}")
         # 中间允许表 = 候选 - 表级剔除 + 补充表，作为 step9b 召回审核的口径参照

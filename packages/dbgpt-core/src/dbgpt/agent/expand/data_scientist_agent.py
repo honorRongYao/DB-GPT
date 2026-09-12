@@ -42,6 +42,11 @@ _DEFAULT_SUMMARY_PROMPT = (
 # 结论生成所用的 skill（改文件即可调整结论质量，无需改代码）
 _SUMMARY_SKILL_RELATIVE_PATH = os.path.join("user", "result-summary", "SKILL.md")
 
+# 校验失败兜底时的用户提示文案：区分"结果不合规"与"SQL 执行失败"两种情况，
+# 避免业务把"SQL 跑挂了"误读成"结果仅供参考"。
+_WARN_UNVERIFIED = "以下结果未经校验通过，可能不满足问题要求，仅供参考。"
+_WARN_SQL_FAILED = "本次 SQL 执行失败，没有取到数据，请调整问题或稍后重试。"
+
 
 class DataScientistAgent(ConversableAgent):
     """Data Scientist Agent."""
@@ -137,15 +142,19 @@ class DataScientistAgent(ConversableAgent):
         sql: Optional[str] = None,
         action_out: Optional[ActionOutput] = None,
         action_reply_obj: Optional[dict] = None,
+        warn: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
         """最后一轮仍未通过校验时的兜底收口。
 
         不再返回失败（否则循环结束、前端空白），而是保留已有结果数据、
         把简短提示写进结论，按"校验通过"返回，供前端展示"结果 + 免责说明"。
+
+        warn: 面向用户的提示文案；不传时用通用的"未经校验"说明。
+        区分文案是为了让业务能分清"SQL 执行失败"与"结果不合规"两种情况。
         """
         # 面向用户只给简短提示：不拼接审核返回的技术性理由（含"修改方法"等
         # 给 Agent 的重试指令），完整原因仅记日志，便于排查。
-        warn = "以下结果未经校验通过，可能不满足问题要求，仅供参考。"
+        warn = warn or _WARN_UNVERIFIED
         if action_out is not None:
             try:
                 obj = action_reply_obj if isinstance(action_reply_obj, dict) else {}
@@ -176,6 +185,7 @@ class DataScientistAgent(ConversableAgent):
         sql: Optional[str] = None,
         action_out: Optional[ActionOutput] = None,
         action_reply_obj: Optional[dict] = None,
+        warn: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
         """校验失败的统一出口：非最后一轮返回失败触发重试，最后一轮兜底收口。"""
         if self._is_last_round():
@@ -184,6 +194,7 @@ class DataScientistAgent(ConversableAgent):
                 sql=sql,
                 action_out=action_out,
                 action_reply_obj=action_reply_obj,
+                warn=warn,
             )
         return False, reason
 
@@ -221,6 +232,30 @@ class DataScientistAgent(ConversableAgent):
             )
         return dbs[0]
 
+    @staticmethod
+    def _extract_result_rows(
+        action_reply_obj: dict,
+    ) -> Tuple[List[str], List[Any]]:
+        """从本轮结果里取出 (列名, 行数据)，用于校验与结论生成。
+
+        数据来源是 ChartAction 执行 SQL 后回填的 data/count（由真实查询结果生成，
+        不是 LLM 输出），因此这里直接复用，不必再把同一条 SQL 执行一次。
+        执行成功但没有 data 键即"查询成功但 0 行"，返回空列表。
+        """
+        rows = action_reply_obj.get("data")
+        if not isinstance(rows, list) or not rows:
+            return [], []
+        first = rows[0]
+        if isinstance(first, dict):
+            columns = list(first.keys())
+            values = [
+                [row.get(col) for col in columns]
+                for row in rows
+                if isinstance(row, dict)
+            ]
+            return columns, values
+        return [], [list(row) for row in rows]
+
     async def correctness_check(
         self, message: AgentMessage
     ) -> Tuple[bool, Optional[str]]:
@@ -236,6 +271,7 @@ class DataScientistAgent(ConversableAgent):
             return await self._check_fail(
                 f"Please check your answer, {action_out.content}.",
                 action_out=action_out,
+                warn=_WARN_SQL_FAILED,
             )
         # action_report.content 理论上是合法 JSON，但一旦不是（如 LLM 输出畸形），
         # json.loads/非 dict 的 .get 会抛异常，直接冲出 correctness_check 被
@@ -273,11 +309,11 @@ class DataScientistAgent(ConversableAgent):
                     action_reply_obj=action_reply_obj,
                 )
 
-            columns, values = await self.database.query(
-                sql=sql,
-                db=action_out.resource_value,
-            )
-            if not values or len(values) <= 0:
+            # 直接复用 ChartAction 已执行的真实结果（data 由 ChartAction 用查询结果
+            # 回填，不是 LLM 生成），避免把同一条 SQL 再执行一次；
+            # 执行成功但没有 data 键，即"查询成功但 0 行"。
+            columns, values = self._extract_result_rows(action_reply_obj)
+            if not values:
                 error_desc = (
                     "Please check your answer, the current SQL cannot find the data to "
                     "determine whether filtered field values or inappropriate filter "
@@ -567,7 +603,9 @@ class DataScientistAgent(ConversableAgent):
             displayed_rows = [dict(zip(columns, row)) for row in values]
         row_count = int(action_reply_obj.get("count") or len(displayed_rows))
         rows_preview = displayed_rows[:50]
-        user_question = question.rsplit("用户问题:\n", 1)[-1].strip()
+        # 与校验环节共用同一套拆分口径：标记写法若对不上就不会拆分，
+        # 会把整段表结构当成"用户问题"传给结论模型，导致结论跑偏且浪费 token
+        user_question, _ = self._split_question_and_schema(question)
         sys_prompt = self._load_summary_skill_prompt() or _DEFAULT_SUMMARY_PROMPT
         human = (
             f"用户问题：{user_question}\n\n"
