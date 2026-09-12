@@ -13,7 +13,7 @@ DORIS_PASSWORD = "dsdHHSA34."
 DATABASE = "voc_ai_test"
 TARGET_TABLE = "category_embedding"
 EMBEDDING_FUNCTION = "voc.bge_embed"
-DEFAULT_MAX_DISTANCE = 0.6
+DEFAULT_MAX_DISTANCE = 0.72
 
 
 def create_connection():

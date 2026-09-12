@@ -44,6 +44,7 @@ from .category_recall import (
     TARGET_TABLE,
     quote_identifier,
     recall_many,
+    sql_quote,
 )
 from .llm import HOContextBody
 
@@ -182,6 +183,23 @@ _DEFAULT_TABLE_VERIFY_PROMPT = """你是数据库专家。对查询方案做"表
 只输出严格 JSON：
 {{"missing_tables": [{{"table": "表名", "reason": "补充原因"}}], "drop_tables": ["表名"]}}
 要求：表名与全表目录完全一致、禁止编造；category_embedding 是内部向量表，永远不允许进入表集合；两个键都不能省略，无动作时输出空数组。
+"""
+
+_DEFAULT_CATEGORY_PATH_CLEAN_PROMPT = """你是品类召回结果审核员。请根据用户问题中的目标品类，逐条审核向量召回得到的完整品类路径。
+
+用户问题：{question}
+关键词：{keyword}
+
+候选路径（序号 | category_id | category_1 > category_2 > category_3 > category_4）：
+{category_paths}
+
+规则：
+1. category_1 的合法值为：厨房电动、新品类、制冷产品、生活家居、宠物产品、个护健康、水净类、园林工具、商用产品、厨房电热、婴儿产品。
+2. 若用户问题明确提到其中一个 category_1 值，只保留 category_1 等于该值的路径；此时无需要求 category_2～category_4 也与关键词匹配。
+3. 若用户问题未明确提到任何上述 category_1 值，则结合一整条 category_1～category_4 路径判断，保留与目标品类本身相符的路径，剔除仅向量相似但属于其他产品的路径。
+4. 不确定时保留，避免误删；禁止修改 category_id 或品类值。
+
+只输出严格 JSON：{{"keep_indexes": [保留路径的序号]}}
 """
 
 _DEFAULT_RECALL_VERIFY_PROMPT = """你是数据库专家。这是"召回审核"（表级校验后的第二步）：逐条判断每条"关键词向量召回"对回答用户问题是否有意义，无意义的序号放入 drop_recalls。
@@ -1619,6 +1637,128 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             item["idx"] = idx
         return items
 
+    async def _clean_category_recall_items(
+        self, question: str, recall_items: List[dict]
+    ) -> List[dict]:
+        """用 LLM 按完整 category_1～category_4 路径清洗品类召回结果。"""
+        cleaned_items = []
+        for item in recall_items:
+            if item.get("table") != "dim_product_category":
+                cleaned_items.append(item)
+                continue
+            columns = [
+                value.strip()
+                for value in str(item.get("columns") or "").split(",")
+                if value.strip().startswith("category_")
+            ]
+            if not columns:
+                cleaned_items.append(item)
+                continue
+            try:
+                column_literals = ", ".join(sql_quote(value) for value in columns)
+                join_conditions = " OR ".join(
+                    f"t1.`{value}` = t2.`raw_data`" for value in columns
+                )
+                keyword = item.get("keyword") or ""
+                paths_sql = (
+                    "SELECT DISTINCT t1.`category_id`, t1.`category_1`, "
+                    "t1.`category_2`, t1.`category_3`, t1.`category_4` "
+                    "FROM `voc_ai_test`.`dim_product_category` AS t1 "
+                    "INNER JOIN (SELECT DISTINCT `raw_data` "
+                    "FROM `voc_ai_test`.`category_embedding` "
+                    "WHERE inner_product_approximate(`vector`, "
+                    f"voc.bge_embed({sql_quote(keyword)})) > {DEFAULT_MAX_DISTANCE} "
+                    "AND `table_name` = 'dim_product_category' "
+                    f"AND `column_name` IN ({column_literals})) AS t2 ON "
+                    f"{join_conditions}"
+                )
+                rows = await self.blocking_func_to_async(
+                    self._datasource.connector.run, paths_sql
+                )
+                paths = []
+                fields = [
+                    "category_id",
+                    "category_1",
+                    "category_2",
+                    "category_3",
+                    "category_4",
+                ]
+                for row in rows:
+                    if isinstance(row, dict):
+                        path = {field: row.get(field) for field in fields}
+                    else:
+                        try:
+                            if row[0] == "category_id":
+                                continue
+                            path = {field: row[idx] for idx, field in enumerate(fields)}
+                        except (IndexError, TypeError, KeyError):
+                            continue
+                    paths.append(path)
+                if not paths:
+                    continue
+                indexed_paths = list(enumerate(paths, start=1))
+                path_lines = "\n".join(
+                    f"{idx} | {row.get('category_id')} | "
+                    + " > ".join(
+                        str(row.get(f"category_{level}") or "")
+                        for level in range(1, 5)
+                    )
+                    for idx, row in indexed_paths
+                )
+                prompt = _DEFAULT_CATEGORY_PATH_CLEAN_PROMPT.format(
+                    question=question,
+                    keyword=item.get("keyword") or "",
+                    category_paths=path_lines,
+                )
+                output = await self._llm_complete(prompt, "请审核以上完整品类路径。")
+                result = self._parse_json_strict(output)
+                keep_indexes = {
+                    int(value)
+                    for value in result.get("keep_indexes") or []
+                    if isinstance(value, (int, float))
+                }
+                kept_paths = [
+                    row for idx, row in indexed_paths if idx in keep_indexes
+                ]
+                if not kept_paths:
+                    logger.info(
+                        "Category path cleaner dropped recall: keyword=%s",
+                        item.get("keyword"),
+                    )
+                    continue
+                category_ids = list(
+                    dict.fromkeys(row.get("category_id") for row in kept_paths)
+                )
+                id_literals = ", ".join(
+                    str(value)
+                    if isinstance(value, (int, float))
+                    else sql_quote(str(value))
+                    for value in category_ids
+                    if value is not None
+                )
+                if not id_literals:
+                    continue
+                cleaned = dict(item)
+                cleaned["sql"] = "\n".join(
+                    [
+                        f"-- 关键词:{item.get('keyword')} 来自表 dim_product_category，主键 category_id，命中列 {item.get('columns')}",
+                        "SELECT DISTINCT",
+                        "    t1.`category_id`",
+                        "FROM `voc_ai_test`.`dim_product_category` AS t1",
+                        f"WHERE t1.`category_id` IN ({id_literals});",
+                    ]
+                )
+                cleaned["category_paths"] = kept_paths
+                cleaned_items.append(cleaned)
+            except Exception as e:
+                logger.warning(
+                    "Clean category recall paths failed, drop unverified category recall: %s",
+                    e,
+                )
+        for idx, item in enumerate(cleaned_items, start=1):
+            item["idx"] = idx
+        return cleaned_items
+
     @staticmethod
     def _build_recall_rows_text(
         recall_items: List[dict], catalog_comments: dict
@@ -1768,6 +1908,7 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             running=True,
         )
         recall_items = await self._vector_recall(keywords)
+        recall_items = await self._clean_category_recall_items(question, recall_items)
         if recall_items:
             logger.info(
                 "Vector recall got %d sqls: %s",
@@ -2042,18 +2183,44 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         )
         recall_context = ""
         if kept_items:
-            # 精简版"使用引导"：仅在有保留召回时出现；无召回/召回全剔时整段不进入提示词
-            recall_context = (
-                "\n\n关键词向量召回 SQL 使用说明：\n"
-                "每段召回 SQL 会把问题中的实体词（品类/品牌/观点等）在内部向量表 "
-                "category_embedding 中按语义相似命中来源业务表的行，并输出这些行的标识列"
-                "（主键）真实取值，用于翻译成 WHERE/关联条件；不要改动其中的向量距离阈值与子查询。\n"
-                "标识列为单列主键：结果可直接用于 IN 过滤或按该主键关联；"
-                "为多列复合主键（逗号分隔）：必须逐列分别匹配"
-                "（AND t.a = r.a AND t.b = r.b ...），禁止把整串当单个列名。\n"
-                "category_embedding 是内部向量表，禁止在业务 SQL 中直接查询/关联。\n\n"
-                "关键词向量召回来源 SQL：\n"
-                + "\n\n".join(item["sql"] for item in kept_items)
+            category_items = [
+                item for item in kept_items if item.get("category_paths")
+            ]
+            other_items = [
+                item for item in kept_items if not item.get("category_paths")
+            ]
+            recall_parts = []
+            if category_items:
+                path_lines = []
+                for item in category_items:
+                    for path in item["category_paths"]:
+                        full_path = " > ".join(
+                            str(path.get(f"category_{level}") or "")
+                            for level in range(1, 5)
+                        )
+                        path_lines.append(
+                            f"- 关键词 {item.get('keyword')}：category_id="
+                            f"{path.get('category_id')}；完整路径={full_path}"
+                        )
+                recall_parts.append(
+                    "LLM 已按完整 category_1～category_4 路径审核以下品类。"
+                    "涉及目标品类时，只允许使用这些 category_id，禁止增加其他品类、"
+                    "恢复原向量子查询或自行模糊匹配：\n"
+                    + "\n".join(path_lines)
+                    + "\n\n清洗后的品类白名单 SQL：\n"
+                    + "\n\n".join(item["sql"] for item in category_items)
+                )
+            if other_items:
+                recall_parts.append(
+                    "以下召回 SQL 输出来源业务表的标识列真实取值，用于 WHERE 或关联；"
+                    "不要改动向量阈值与子查询。复合主键必须逐列匹配。"
+                    "category_embedding 是内部向量表，禁止在业务 SQL 中"
+                    "直接查询或关联。\n\n"
+                    "其他关键词向量召回来源 SQL：\n"
+                    + "\n\n".join(item["sql"] for item in other_items)
+                )
+            recall_context = "\n\n关键词向量召回结果：\n" + "\n\n".join(
+                recall_parts
             )
 
         # step14 组装 user 消息：允许表 + 完整表结构 + 召回来源 SQL + 用户问题
