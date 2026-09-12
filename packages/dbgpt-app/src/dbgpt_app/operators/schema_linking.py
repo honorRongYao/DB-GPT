@@ -58,6 +58,9 @@ MAX_EXTRACT_KEYWORDS = 5
 # category_embedding(TARGET_TABLE) 是向量召回内部表。二者均非业务数据表。
 _INTERNAL_SKIP_TABLES = {TARGET_TABLE, "table_semantic"}
 
+# 提示词模板统一约定：模板里字面 JSON 花括号一律双写（{{ }}），并在交给
+# _llm_complete 前一律经过 .format()（没有占位符也要调用）。这样后续给任一模板
+# 新增 {占位符} 都不会因为单花括号而抛 KeyError。
 _DEFAULT_SELECT_TABLE_PROMPT = """你是一个数据库专家，请为用户问题选出所需数据表，并说明表间关联关系。
 
 数据库 {db_name} 全部可用表目录（格式：表名 -- 表注释；注释含业务含义、字段说明及与其他表的关联关系，请仔细阅读）：
@@ -157,13 +160,13 @@ _DEFAULT_EXTRACT_KEYWORDS_PROMPT = """你是一个数据分析助手。请从用
 7. 提取结果若存在包含关系（如"德龙咖啡机"包含"咖啡机"），只保留最小粒度的词。
 
 输出严格 JSON（只输出 JSON，不要任何解释文字）：
-{"关键词列表": ["咖啡机", "异味"]}
+{{"关键词列表": ["咖啡机", "异味"]}}
 
 示例1 输入：帮我分析2026年上半年咖啡机的异味问题
-输出：{"关键词列表": ["咖啡机", "异味"]}
+输出：{{"关键词列表": ["咖啡机", "异味"]}}
 
 示例2 输入：分别统计广东省和华东地区电动风扇的销量
-输出：{"关键词列表": ["广东省", "华东地区", "电动风扇"]}
+输出：{{"关键词列表": ["广东省", "华东地区", "电动风扇"]}}
 """
 
 _DEFAULT_TABLE_VERIFY_PROMPT = """你是数据库专家。对查询方案做"表级校验"，一次输出两组动作：补缺失表（missing_tables）、剔无关表（drop_tables）。召回 SQL 的审核在下一步单独做，本步不要关心召回。
@@ -1156,7 +1159,9 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         for attempt in range(1, 3):  # 首次尝试 + 重试 1 次
             try:
                 output = await self._llm_complete(
-                    _DEFAULT_EXTRACT_KEYWORDS_PROMPT, f"用户问题：{question}"
+                    # 与其他模板保持统一：模板内字面花括号双写，这里统一渲染
+                    _DEFAULT_EXTRACT_KEYWORDS_PROMPT.format(),
+                    f"用户问题：{question}",
                 )
                 result = self._parse_keywords_result(output)
                 if result:
