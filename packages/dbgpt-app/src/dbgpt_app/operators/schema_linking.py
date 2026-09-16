@@ -132,17 +132,31 @@ _DEFAULT_VERIFY_TABLES_PROMPT = """你是数据库专家。校验"已选表字�
 要求：表名与目录完全一致、禁止编造；只补真正缺失的表；只输出严格 JSON。
 """
 
-_DEFAULT_REWRITE_QUESTION_PROMPT = """你是对话理解助手。下面是当前问题出现前的最近几轮对话记录：
+_DEFAULT_REWRITE_QUESTION_PROMPT = """你是对话理解助手。下面是当前问题出现前的最近几轮对话记录（仅供判断指代，不是问题的一部分）：
 {history}
 
-判断：当前用户问题是否引用了前文？满足任一即算引用：
-1. 含指代词（那/这个/它/上面/刚才/环比/同比/继续/再/还/结果/数据）；
-2. 缺主语或实体（没提品类/品牌/统计对象）；
-3. 缺时间基准或口径（如"环比是多少"没说对比哪期哪个范围）；
-4. 与前一问属同一话题的追问。
+任务：判断当前用户问题是否"必须"依赖前文才能理解。判断必须从严：只要有一点疑问、需要猜测前文才说得通，一律判为不依赖（related=false），原样返回。
 
-若引用前文：改写为自包含的完整问题，把前文的实体（品类/品牌/商品）、时间范围（如 Q1、202601-202603）、过滤条件、统计口径写进问题，脱离前文也能独立理解。
-若未引用：保持原问题原样输出。
+【判为不依赖（related=false）】
+1. 当前问题已自带分析对象（品类/品牌/商品/地区等）和诉求；
+2. 只是与前一问话题相近、句式相似，但分析对象不同；
+3. 个别词与前文重合，但问题本身语义完整、能独立理解；
+4. 只含"近N个月/最近N天/上月/今年以来/Q1"等相对时间——有当前日期即可换算，不算缺口径；
+5. 只能"感觉"与前文有关，却指不出到底缺了哪个具体的词或对象。
+
+【判为依赖（related=true）】
+仅限当前问题存在明确的悬空指代、脱离前文无法确定指向：
+1. 含指代词，且指代对象不在本问题内（那/它/这个/上面/刚才/前者）；
+2. 完全没给分析对象（如"那TOP3品牌呢""再看下趋势""分别是多少"）；
+3. 只有"环比/同比/继续/还有呢"，既没对象也没口径。
+
+若判为依赖：只补当前问题缺失的那部分，改写为自包含的完整问题。改写铁律：
+1. 只增不改：当前问题已写明的对象、条件、时间表达必须原样保留，一个字都不要替换；
+2. 当前问题已给出的时间表达（尤其"近N个月/最近N天/上月/今年以来/Q1"）保持原样，禁止替换成任何具体年月区间；
+3. 严禁从历史中搬运时间范围、结果数值、结论、SQL 或与当前对象无关的过滤条件——历史里出现过的数字、区间、结论都不是问题的一部分；
+4. 补齐后必须与用户本意一致；只要存在需要猜测的地方，就改判为 related=false，原样返回。
+
+若判为不依赖：原样输出当前问题。
 
 只输出严格 JSON：
 {{"related": true 或 false, "rewritten_question": "改写后的完整问题（related 为 false 时与原问题相同）"}}
@@ -197,13 +211,18 @@ _DEFAULT_CATEGORY_PATH_CLEAN_PROMPT = """你是品类召回结果审核员。请
 {category_paths}
 
 规则：
-1. category_1 的合法值为：厨房电动、新品类、制冷产品、生活家居、宠物产品、个护健康、水净类、园林工具、商用产品、厨房电热、婴儿产品。
+1. category_1 的合法值为：{category_1_values}。
 2. 若用户问题明确提到其中一个 category_1 值，只保留 category_1 等于该值的路径；此时无需要求 category_2～category_4 也与关键词匹配。
 3. 若用户问题未明确提到任何上述 category_1 值，则结合一整条 category_1～category_4 路径判断，保留与目标品类本身相符的路径，剔除仅向量相似但属于其他产品的路径。
 4. 不确定时保留，避免误删；禁止修改 category_id 或品类值。
 
 只输出严格 JSON：{{"keep_indexes": [保留路径的序号]}}
 """
+
+# 品类路径审核只需要在固定的候选里挑序号，不需要创造性，
+# 用接近 0 的温度压低采样随机性，让同一份候选尽量给出同样的序号集合。
+# 注意不能传 0：下游 OpenAI 兼容客户端是 `if request.temperature:`，0 会被当假值丢掉。
+_CATEGORY_CLEAN_TEMPERATURE = 0.01
 
 _DEFAULT_RECALL_VERIFY_PROMPT = """你是数据库专家。这是"召回审核"（表级校验后的第二步）：逐条判断每条"关键词向量召回"对回答用户问题是否有意义，无意义的序号放入 drop_recalls。
 
@@ -235,7 +254,13 @@ _REWRITE_HISTORY_MAX_ROUNDS = 5
 _REWRITE_HISTORY_MAX_CHARS = 200
 # 标准 DB-GPT 对话中 UserProxyAgent 的 role，用于按真实 conv_id 模糊检索整段会话历史
 _REWRITE_HISTORY_ROLE = "Human"
-_SCHEMA_LINKING_INJECT_MARKER = "以下数据表已由语义层根据你的问题选好"
+# 语义层注入 user 消息后的起始标记：入库的是"允许表 + 完整表结构 + 召回 SQL + 用户问题"
+# 这一整段长文本，读历史时必须按标记剥离出末尾真正的用户问题，否则表结构会把问题挤掉。
+# 新标记与当前 step14 注入一致，旧标记用于兼容更早版本已入库的历史数据。
+_SCHEMA_LINKING_INJECT_MARKERS = (
+    "允许使用的表及表间关联关系",
+    "以下数据表已由语义层根据你的问题选好",
+)
 _SCHEMA_LINKING_QUESTION_MARKER = "用户问题:"
 
 _PARAMETER_DATASOURCE = Parameter.build_from(
@@ -600,20 +625,32 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             {"table": t.split(" -- ", 1)[0], "relation": ""} for t in catalog
         ]
 
-    async def _build_model_request(self, messages: List[ModelMessage]) -> ModelRequest:
+    async def _build_model_request(
+        self, messages: List[ModelMessage], temperature: Optional[float] = None
+    ) -> ModelRequest:
         models = await self.llm_client.models()
         if not models:
             raise ValueError("No models available.")
         model = self._model or models[0].model
-        return ModelRequest.build_request(model, messages=messages)
+        if temperature is None:
+            return ModelRequest.build_request(model, messages=messages)
+        return ModelRequest.build_request(
+            model, messages=messages, temperature=temperature
+        )
 
-    async def _llm_complete(self, prompt: str, user_content: str) -> str:
-        """执行一次 LLM 补全（system=提示词, user=问题），返回输出文本。"""
+    async def _llm_complete(
+        self, prompt: str, user_content: str, temperature: Optional[float] = None
+    ) -> str:
+        """执行一次 LLM 补全（system=提示词, user=问题），返回输出文本。
+
+        temperature 只在需要压低采样随机性的调用里显式传入（如品类路径审核），
+        不传时沿用服务端默认，保持其它调用链行为不变。
+        """
         messages = [
             ModelMessage(role=ModelMessageRoleType.SYSTEM, content=prompt),
             ModelMessage(role=ModelMessageRoleType.HUMAN, content=user_content),
         ]
-        model_request = await self._build_model_request(messages)
+        model_request = await self._build_model_request(messages, temperature)
         model_output: ModelOutput = await self.llm_client.generate(model_request)
         return model_output.text
 
@@ -775,8 +812,10 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                             + "\n"
                             + "\n".join(value_lines)
                         )
-            # 表语义细节：语义文本按行分行展示；只对确认后的选中表生效，未配置则跳过
-            semantic = semantics_map.get(table_name, "")
+            # 表语义细节：语义文本按行分行展示；只对确认后的选中表生效，未配置则跳过。
+            # 同一张表允许配多条语义（table_semantic 是 DUPLICATE KEY 表），按读取
+            # 顺序依次拼接，块间空一行
+            semantic = "\n\n".join(semantics_map.get(table_name) or [])
             if semantic:
                 if len(semantic) > 8000:
                     semantic = semantic[:8000].rstrip() + "\n(细节内容过长，已截断)"
@@ -983,16 +1022,32 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
 
     @staticmethod
     def _strip_schema_linking_text(content: str) -> str:
-        """去掉语义层注入到消息里的表结构文本，只保留真正的用户问题/回答内容。"""
+        """去掉语义层注入到消息里的表结构文本，只保留真正的用户问题/回答内容。
+
+        注入文本结构固定为"注入标记 + 表清单 + 表结构 + 召回 SQL + 用户问题:",
+        真正的问题永远在最后，所以剥离分两级：
+          1) 命中注入起始标记 → 取标记之后最后一个 "用户问题:" 后面的内容；
+          2) 标记对不上（注入格式改版、历史遗留数据）→ 退化为直接取最后一个
+             "用户问题:" 后面的内容，避免整段表结构被当成用户问题截进上下文；
+             仍拿不到则原样返回（不是注入文本，如普通回复）。
+        """
         if not content:
             return ""
-        idx = content.find(_SCHEMA_LINKING_INJECT_MARKER)
-        if idx < 0:
-            return content
-        q_idx = content.find(_SCHEMA_LINKING_QUESTION_MARKER, idx)
-        if q_idx < 0:
-            return ""
-        return content[q_idx + len(_SCHEMA_LINKING_QUESTION_MARKER) :].strip()
+        idx = -1
+        for marker in _SCHEMA_LINKING_INJECT_MARKERS:
+            idx = content.find(marker)
+            if idx >= 0:
+                break
+        if idx >= 0:
+            q_idx = content.rfind(_SCHEMA_LINKING_QUESTION_MARKER)
+            if q_idx < idx:
+                # 注入段落里没有紧跟用户问题，视为纯注入内容，无可保留信息
+                return ""
+            return content[q_idx + len(_SCHEMA_LINKING_QUESTION_MARKER) :].strip()
+        q_idx = content.rfind(_SCHEMA_LINKING_QUESTION_MARKER)
+        if q_idx >= 0:
+            return content[q_idx + len(_SCHEMA_LINKING_QUESTION_MARKER) :].strip()
+        return content
 
     @staticmethod
     def _extract_conclusion_text(content: str) -> str:
@@ -1191,6 +1246,8 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         重试 1 次；仍失败静默返回原问题，不阻塞主流程。
         """
         current = self._strip_schema_linking_text(question).strip()
+        if not current:
+            return question
         history = await self._build_history_text_from_db(input_value)
         if not history:
             return question
@@ -1199,7 +1256,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
             try:
                 prompt = _DEFAULT_REWRITE_QUESTION_PROMPT.format(history=history)
                 output = await self._llm_complete(
-                    prompt, f"当前用户问题：{question}"
+                    prompt, f"当前用户问题：{current}"
                 )
                 related, rewritten = self._parse_rewrite_result(output)
                 if not related:
@@ -1283,11 +1340,12 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         return result
 
     async def _load_table_semantics(self, table_names: List[str]) -> dict:
-        """读取选中表的语义/约束细节，返回 {表名: 语义文本}。
+        """读取选中表的语义/约束细节，返回 {表名: [语义文本, ...]}。
 
         语义表 table_semantic 中 `table` 列存表名、`semantic` 列存该表的约束细节
-        （如某字段如何计算、统计口径等）。该表不存在或查询失败时静默返回空 dict，
-        不影响主流程。
+        （如某字段如何计算、统计口径等）。该表是 DUPLICATE KEY 表，同一表名可以配
+        多条语义，这里全部保留（不再同表互相覆盖），并剔除完全重复的文本。
+        该表不存在或查询失败时静默返回空 dict，不影响主流程。
         """
         if not table_names:
             return {}
@@ -1300,7 +1358,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         except Exception as e:
             logger.warning(f"Load table_semantic failed: {e}")
             return {}
-        semantics = {}
+        semantics: dict = {}
         wanted = set(table_names)
         for row in rows:
             if isinstance(row, dict):
@@ -1316,7 +1374,10 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
                 except (IndexError, TypeError, KeyError):
                     continue
             if t_name in wanted and t_sem:
-                semantics[str(t_name)] = str(t_sem)
+                texts = semantics.setdefault(str(t_name), [])
+                text = str(t_sem)
+                if text not in texts:
+                    texts.append(text)
         return semantics
 
     # ---------------- 主流程 ----------------
@@ -1642,11 +1703,71 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             item["idx"] = idx
         return items
 
+    async def _top_recall_raw_data(
+        self, keyword: str, columns: List[str]
+    ) -> Optional[str]:
+        """取与关键词语义最相近的品类层级值（向量相似度最高）。
+
+        仅在关键词与库里的品类值字面对不上时用作语义锚定，
+        例如"声波牙刷"→"声波电动牙刷"。同分时按值字典序取，保证结果唯一。
+        """
+        if not keyword:
+            return None
+        column_literals = ", ".join(sql_quote(value) for value in columns)
+        sql = (
+            "SELECT `raw_data`, "
+            "MAX(inner_product_approximate(`vector`, q.`vec`)) AS `score` "
+            "FROM `voc_ai_test`.`category_embedding`, "
+            f"(SELECT voc.bge_embed({sql_quote(keyword)}) AS `vec`) q "
+            "WHERE `table_name` = 'dim_product_category' "
+            f"AND `column_name` IN ({column_literals}) "
+            "GROUP BY `raw_data` ORDER BY `score` DESC, `raw_data` ASC LIMIT 1"
+        )
+        try:
+            rows = await self.blocking_func_to_async(
+                self._datasource.connector.run, sql
+            )
+        except Exception as e:
+            logger.warning(f"Semantic anchor query failed, skip: {e}")
+            return None
+        for row in rows:
+            if isinstance(row, dict):
+                value = row.get("raw_data")
+            elif row and row[0] != "raw_data":
+                value = row[0]
+            else:
+                continue
+            if value:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _match_category_keyword(
+        path: dict, keyword: str, levels: Tuple[int, ...] = (2, 3, 4)
+    ) -> bool:
+        """关键词与指定品类层级等值命中，视为确定匹配。
+
+        只做等值对齐、不做包含匹配：包含匹配会把"电动牙刷头""旅行盒"
+        也算成"电动牙刷"的命中，判定同样不可预期。
+        """
+        kw = (keyword or "").strip()
+        if not kw:
+            return False
+        return any(
+            str(path.get(f"category_{level}") or "").strip() == kw
+            for level in levels
+        )
+
     async def _clean_category_recall_items(
         self, question: str, recall_items: List[dict]
     ) -> List[dict]:
-        """用 LLM 按完整 category_1～category_4 路径清洗品类召回结果。"""
+        """清洗品类召回：整值命中走规则，库里没有该词时才让模型做语义判断。
+
+        等值命中（如"冰箱"）本身就是确定答案，不需要也不应该交给模型；库里没有
+        该词时（如"牙刷""洗牙器"）才由模型在候选里挑，模型不可用再回退语义锚。
+        """
         cleaned_items = []
+        category_1_values = await self._list_category_1_values()
         for item in recall_items:
             if item.get("table") != "dim_product_category":
                 cleaned_items.append(item)
@@ -1675,7 +1796,10 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                     f"voc.bge_embed({sql_quote(keyword)})) > {DEFAULT_MAX_DISTANCE} "
                     "AND `table_name` = 'dim_product_category' "
                     f"AND `column_name` IN ({column_literals})) AS t2 ON "
-                    f"{join_conditions}"
+                    f"{join_conditions} "
+                    # DISTINCT 不保证行序，不显式排序会让候选顺序每次都变，
+                    # 进而让基于位置的信息（引用序号、人工排查）失去可比性。
+                    "ORDER BY t1.`category_id`"
                 )
                 rows = await self.blocking_func_to_async(
                     self._datasource.connector.run, paths_sql
@@ -1701,35 +1825,10 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                     paths.append(path)
                 if not paths:
                     continue
-                indexed_paths = list(enumerate(paths, start=1))
-                path_lines = "\n".join(
-                    f"{idx} | {row.get('category_id')} | "
-                    + " > ".join(
-                        str(row.get(f"category_{level}") or "")
-                        for level in range(1, 5)
-                    )
-                    for idx, row in indexed_paths
+                kept_paths = await self._select_category_paths(
+                    question, keyword, paths, columns, category_1_values
                 )
-                prompt = _DEFAULT_CATEGORY_PATH_CLEAN_PROMPT.format(
-                    question=question,
-                    keyword=item.get("keyword") or "",
-                    category_paths=path_lines,
-                )
-                output = await self._llm_complete(prompt, "请审核以上完整品类路径。")
-                result = self._parse_json_strict(output)
-                keep_indexes = {
-                    int(value)
-                    for value in result.get("keep_indexes") or []
-                    if isinstance(value, (int, float))
-                }
-                kept_paths = [
-                    row for idx, row in indexed_paths if idx in keep_indexes
-                ]
                 if not kept_paths:
-                    logger.info(
-                        "Category path cleaner dropped recall: keyword=%s",
-                        item.get("keyword"),
-                    )
                     continue
                 category_ids = list(
                     dict.fromkeys(row.get("category_id") for row in kept_paths)
@@ -1764,13 +1863,168 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             item["idx"] = idx
         return cleaned_items
 
+    async def _list_category_1_values(self) -> List[str]:
+        """取库里真实的 category_1 全部取值，供提示词动态注入。
+
+        写死在提示词里会随库演进而过期，这里实时查库，库里加减大类自动生效；
+        查询失败时返回空列表，提示词退化为不提供白名单，由模型按完整路径自行判断。
+        """
+        sql = (
+            "SELECT DISTINCT `category_1` FROM `voc_ai_test`.`dim_product_category` "
+            "WHERE `category_1` IS NOT NULL AND `category_1` <> '' "
+            "ORDER BY `category_1`"
+        )
+        try:
+            rows = await self.blocking_func_to_async(
+                self._datasource.connector.run, sql
+            )
+        except Exception as e:
+            logger.warning(f"List category_1 values failed, skip: {e}")
+            return []
+        values = []
+        for row in rows:
+            if isinstance(row, dict):
+                value = row.get("category_1")
+            elif row and row[0] != "category_1":
+                value = row[0]
+            else:
+                continue
+            if value:
+                values.append(str(value))
+        return values
+
+    @staticmethod
+    def _parse_keep_indexes(text: str) -> set:
+        """解析模型输出里的保留序号。
+
+        兼容模型把序号写成字符串（如 ["1", "2"]）：这类写法若按数字类型过滤会被
+        全部丢掉，进而被当成"模型没保留任何路径"，误伤整条召回。
+        """
+        data = HOSchemaLinkingRetrieverOperator._parse_json_strict(text)
+        indexes = set()
+        for value in data.get("keep_indexes") or []:
+            try:
+                indexes.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return indexes
+
+    async def _select_category_paths(
+        self,
+        question: str,
+        keyword: str,
+        paths: List[dict],
+        columns: List[str],
+        category_1_values: List[str],
+    ) -> List[dict]:
+        """选保留的品类路径：整值命中的走规则，命中不了的才让模型做语义判断。
+
+        库里已有该关键词时，等值命中就是确定答案，交给模型只会把真实命中的路径
+        砍掉（如"冰箱"下只保留 3/6 个）且输出不稳定；库里没有该词时（如"牙刷"
+        "洗牙器"）等值对齐给不出正确答案，才需要模型的语义判断。
+        """
+        kept_paths = [
+            path for path in paths if self._match_category_keyword(path, keyword)
+        ]
+        if kept_paths:
+            return kept_paths
+        kept_paths = [
+            path
+            for path in paths
+            if self._match_category_keyword(path, keyword, levels=(1,))
+        ]
+        if kept_paths:
+            # 关键词命中的是品类大类（如"个护健康"）：保留该大类下全部候选
+            return kept_paths
+        kept_paths = await self._select_paths_by_llm(
+            question, keyword, paths, category_1_values
+        )
+        if kept_paths:
+            return kept_paths
+        return await self._align_by_semantic_anchor(keyword, paths, columns)
+
+    async def _select_paths_by_llm(
+        self,
+        question: str,
+        keyword: str,
+        paths: List[dict],
+        category_1_values: List[str],
+    ) -> List[dict]:
+        """让模型在候选路径里挑与关键词相符的，返回空表示没拿到可用结果。"""
+        indexed_paths = list(enumerate(paths, start=1))
+        path_lines = "\n".join(
+            f"{idx} | {row.get('category_id')} | "
+            + " > ".join(
+                str(row.get(f"category_{level}") or "") for level in range(1, 5)
+            )
+            for idx, row in indexed_paths
+        )
+        prompt = _DEFAULT_CATEGORY_PATH_CLEAN_PROMPT.format(
+            question=question,
+            keyword=keyword,
+            category_paths=path_lines,
+            category_1_values="、".join(category_1_values) or "（未取到，按路径判断）",
+        )
+        try:
+            output = await self._llm_complete(
+                prompt,
+                "请审核以上完整品类路径。",
+                temperature=_CATEGORY_CLEAN_TEMPERATURE,
+            )
+            keep_indexes = self._parse_keep_indexes(output)
+            kept_paths = [row for idx, row in indexed_paths if idx in keep_indexes]
+            if kept_paths:
+                logger.info(
+                    "Category path cleaner kept %d/%d paths: keyword=%s",
+                    len(kept_paths),
+                    len(paths),
+                    keyword,
+                )
+                return kept_paths
+            logger.info(
+                "Category path cleaner kept nothing, fallback to rule alignment: "
+                "keyword=%s",
+                keyword,
+            )
+        except Exception as e:
+            logger.warning(
+                "Category path cleaner failed, fallback to rule alignment: %s", e
+            )
+        return []
+
+    async def _align_by_semantic_anchor(
+        self, keyword: str, paths: List[dict], columns: List[str]
+    ) -> List[dict]:
+        """用语义锚（向量命中的最高相似度层级值）对齐，仍打不到就保留全部候选。"""
+        anchor = await self._top_recall_raw_data(keyword, columns)
+        if anchor:
+            logger.info(
+                "Category keyword aligned to recalled value: %s -> %s",
+                keyword,
+                anchor,
+            )
+            kept_paths = [
+                path for path in paths if self._match_category_keyword(path, anchor)
+            ]
+            if kept_paths:
+                return kept_paths
+        # 兜底保留全部候选：宁可范围宽，也不丢整条召回
+        return list(paths)
+
     @staticmethod
     def _build_recall_rows_text(
         recall_items: List[dict], catalog_comments: dict
     ) -> str:
-        """把召回清单渲染成"序号. 关键词；来源表（表注释）；命中列"文本，供合并校验逐条审核。"""
+        """把召回清单渲染成"序号. 关键词；来源表（表注释）；命中列"文本，供合并校验逐条审核。
+
+        品类路径定稿项（带 category_paths，已在 step4 收敛为 category_id 白名单 SQL）
+        不进清单：它是按完整 category_1～category_4 路径逐条审核后的确定结果，不是待审的
+        向量召回；混在清单里只会被当成"同词冗余召回"剔掉，连带白名单 SQL 一起消失。
+        """
         rows = []
         for item in recall_items:
+            if item.get("category_paths"):
+                continue
             table = item.get("table") or ""
             comment = catalog_comments.get(table, "") if table else ""
             table_desc = table if not comment else f"{table}（{comment}）"
@@ -2050,6 +2304,17 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                     if item.get("table") and item["table"] not in selected_set
                 }
             }
+        # 品类路径定稿项不受召回审核影响：它的 category_id 由完整路径逐条审核得出，
+        # 是确定结果；审核清单已不渲染它，但模型仍可能凭编号误点，这里强制摘掉。
+        finalized_idxs = {
+            item["idx"] for item in recall_items if item.get("category_paths")
+        }
+        if recall_actions["drop_recalls"] & finalized_idxs:
+            logger.info(
+                "Ignore drop_recalls of finalized category recalls: %s",
+                sorted(recall_actions["drop_recalls"] & finalized_idxs),
+            )
+            recall_actions["drop_recalls"] -= finalized_idxs
         if recall_actions["drop_recalls"]:
             logger.info(
                 "Recall verify dropped recall ids: %s",
@@ -2187,13 +2452,16 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             final_names, catalog_comments, columns_by_table, value_fields_map
         )
         recall_context = ""
-        if kept_items:
-            category_items = [
-                item for item in kept_items if item.get("category_paths")
-            ]
-            other_items = [
-                item for item in kept_items if not item.get("category_paths")
-            ]
+        # 品类白名单与召回审核解耦：定稿项只取决于"来源表是否仍在允许表内"，
+        # 普通召回被全剔时也必须注入——白名单丢了，Agent 就只能靠 LIKE 或自行枚举值兜底。
+        category_items = [
+            item
+            for item in recall_items
+            if item.get("category_paths")
+            and (not item.get("table") or item["table"] in final_names)
+        ]
+        other_items = [item for item in kept_items if not item.get("category_paths")]
+        if category_items or other_items:
             recall_parts = []
             if category_items:
                 path_lines = []

@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Any, List, Optional, Tuple
 
@@ -13,7 +14,7 @@ from dbgpt.core import (
 )
 
 from ..core.action.base import ActionOutput
-from ..core.agent import AgentMessage
+from ..core.agent import Agent, AgentMessage
 from ..core.base_agent import ConversableAgent
 from ..core.profile import DynConfig, ProfileConfig
 from ..resource.database import DBResource
@@ -26,14 +27,18 @@ _DEFAULT_SUMMARY_PROMPT = (
     "你是资深商业数据分析师。请基于用户问题与真实查询结果，"
     "输出业务人员能直接看懂的中文分析结论。\n"
     "只使用给定数据，不得虚构或补充结果中不存在的信息；"
-    "只使用结果中出现的字段，不得自造维度；必须区分结果总行数与预览行数。\n"
+    "只使用结果中出现的字段，不得自造维度；必须区分三个行数："
+    "总行数、展示行数（下发给用户看到的行数）、结论依据行数（你实际据以分析的行数），"
+    "不得把展示行数或预览行数当作完整结果（见输入中的【结果样本范围】）。\n"
     "按以下四段输出，段间空一行，不要使用 Markdown 语法（不要 **、##、表格），"
     "涨跌用 ↑ ↓ 标注：\n"
     "📌 结论\n一句话直接回答用户问题，带最关键的数字，不超过60字。\n"
     "🔍 关键发现\n用 1. 2. 3. 编号，按重要性排序只保留2-4条，"
     "每条为「现象+数字+对比+业务含义」。\n"
     "💡 建议行动\n用 1. 2. 编号，只给2-3条可直接执行的动作。\n"
-    "⚠️ 数据说明\n一到两句，只写口径、局限或置信度，无歧义时可省略。\n"
+    "⚠️ 数据说明\n一到两句，只写口径、局限或置信度，无歧义时可省略；"
+    "但三个行数不一致时不得省略，必须用一句白话写清这三层范围"
+    "（如「共查出 5000 行，页面只展示前 200 行，本结论基于前 50 行生成」）。\n"
     "不评价 SQL，不描述生成过程。只输出严格 JSON，且只能有 thought 一个键"
     "（禁止 output、reasoning、answer 等其他键）："
     "{\"thought\": \"四段结论\"}，换行用 \\n 转义。"
@@ -46,6 +51,31 @@ _SUMMARY_SKILL_RELATIVE_PATH = os.path.join("user", "result-summary", "SKILL.md"
 # 避免业务把"SQL 跑挂了"误读成"结果仅供参考"。
 _WARN_UNVERIFIED = "以下结果未经校验通过，可能不满足问题要求，仅供参考。"
 _WARN_SQL_FAILED = "本次 SQL 执行失败，没有取到数据，请调整问题或稍后重试。"
+
+# SQL 执行失败后统一做一次诊断：先裁掉异常串里的噪声，再让大模型判断"为什么报错"，
+# 把诊断结论（而非原始异常）作为重试反馈回喂给 Agent。
+_SQL_ECHO_RE = re.compile(r"\[SQL:.*?(?=\n\(Background on this error|\Z)", re.DOTALL)
+_SQL_PARAMS_RE = re.compile(
+    r"\[parameters:.*?(?=\n\(Background on this error|\Z)", re.DOTALL
+)
+_SQL_DOC_RE = re.compile(r"\(Background on this error at:.*?\)", re.DOTALL)
+
+_SQL_ERROR_ANALYZE_PROMPT = (
+    "你是一个严谨的数据库专家。数据分析 Agent 生成的一条 SQL 执行失败了，"
+    "请判断它为什么报错，并给出最小改动的修正建议。\n"
+    "要求：\n"
+    "1. 必须以给出的报错信息为依据，明确指出具体原因：哪个对象、哪一步、"
+    "违反了哪条规则。不要泛泛而谈，也不要把所有可能的猜测都列一遍；\n"
+    "2. 报错信息里已经写明的事实直接采信（例如报错说某表在某库不存在，"
+    "就认定该对象不可用），不要反向怀疑报错本身；\n"
+    "3. 严禁编造表名、字段名、库名。若报错是表/字段不存在或无权访问，"
+    "必须如实说明该对象不可用，不得把它换成另一张表名，也不得臆造新表；\n"
+    "4. suggestion 只给能直接套用的最小改动（指明改哪个位置、改成什么）；"
+    "现有信息不足以给出可靠改法时，写『需重新核对可用表与字段后重写 SQL』；\n"
+    "5. cause 不超过 120 字，suggestion 不超过 200 字。\n"
+    '只输出严格 JSON：{"cause": "报错的根本原因", '
+    '"suggestion": "最小改动的修正建议（中文）"}'
+)
 
 
 class DataScientistAgent(ConversableAgent):
@@ -111,7 +141,7 @@ class DataScientistAgent(ConversableAgent):
         ),
     )
 
-    max_retry_count: int = 5
+    max_retry_count: int = 10
     language: str = "zh"
 
     def __init__(self, **kwargs):
@@ -256,6 +286,47 @@ class DataScientistAgent(ConversableAgent):
             return columns, values
         return [], [list(row) for row in rows]
 
+    async def verify(
+        self,
+        message: AgentMessage,
+        sender: Agent,
+        reviewer: Optional[Agent] = None,
+        **kwargs,
+    ) -> Tuple[bool, Optional[str]]:
+        """校验本轮回复，SQL 执行失败时先让大模型诊断再重试。
+
+        基类 verify 在 action 执行失败时会直接返回 action_output.content（原始英文
+        异常串）并短路，永远不会走到 correctness_check。这里前置拦截并替换掉那句
+        转发，用诊断结论当重试反馈——原始异常串含 SQL 回显与文档链接，直接回喂会
+        干扰模型。
+
+        不分简单/复杂，统一都让大模型判断"为什么报错"。ActionOutput.content 只有
+        报错、不含 SQL，SQL 从 LLM 原始回复里取。
+        """
+        action_out = message.action_report
+        review_approved = not message.review_info or message.review_info.approve
+        if action_out is not None and not action_out.is_exe_success and review_approved:
+            question = getattr(self, "_current_question", "") or ""
+            error_desc = action_out.content or ""
+            if not question:
+                logger.warning(
+                    "SQL failed but current question is empty, skip analysis"
+                )
+                feedback = f"Please check your answer, {error_desc}."
+            else:
+                feedback = await self._analyze_sql_error(
+                    question,
+                    self._extract_sql_from_reply(message.content),
+                    error_desc,
+                )
+                logger.info(f"SQL error analyzed, retry feedback: {feedback}")
+            return await self._check_fail(
+                feedback,
+                action_out=action_out,
+                warn=_WARN_SQL_FAILED,
+            )
+        return await super().verify(message, sender, reviewer, **kwargs)
+
     async def correctness_check(
         self, message: AgentMessage
     ) -> Tuple[bool, Optional[str]]:
@@ -268,11 +339,9 @@ class DataScientistAgent(ConversableAgent):
             )
 
         if not action_out.is_exe_success:
-            return await self._check_fail(
-                f"Please check your answer, {action_out.content}.",
-                action_out=action_out,
-                warn=_WARN_SQL_FAILED,
-            )
+            # 执行失败的情况已在 verify 里前置拦截并做过诊断，走不到这里；
+            # 保底仍按失败返回，避免被直接调用时把报错串当成结果解析。
+            return False, action_out.content or ""
         # action_report.content 理论上是合法 JSON，但一旦不是（如 LLM 输出畸形），
         # json.loads/非 dict 的 .get 会抛异常，直接冲出 correctness_check 被
         # generate_reply 最外层 except 捕获，导致整轮重试中断且原因不可读。
@@ -360,7 +429,11 @@ class DataScientistAgent(ConversableAgent):
                 question = getattr(self, "_current_question", "") or ""
                 if question:
                     check_ok, check_reason = await self._llm_result_check(
-                        question, sql, columns, values
+                        question,
+                        sql,
+                        columns,
+                        values,
+                        total_rows=action_reply_obj.get("count"),
                     )
                     if not check_ok:
                         return await self._check_fail(
@@ -380,9 +453,17 @@ class DataScientistAgent(ConversableAgent):
                 return True, None
         except Exception as e:
             logger.exception(f"DataScientist check exception！{str(e)}")
+            question = getattr(self, "_current_question", "") or ""
+            if question:
+                # 与执行失败路径一致：统一先诊断，用结论替代原始异常串回喂
+                feedback = await self._analyze_sql_error(question, sql, str(e))
+            else:
+                feedback = (
+                    "SQL execution error, please re-read the historical information "
+                    f"to fix this SQL. The error message is as follows:{str(e)}"
+                )
             return await self._check_fail(
-                f"SQL execution error, please re-read the historical information to "
-                f"fix this SQL. The error message is as follows:{str(e)}",
+                feedback,
                 sql=sql,
                 action_out=action_out,
                 action_reply_obj=action_reply_obj,
@@ -450,7 +531,12 @@ class DataScientistAgent(ConversableAgent):
             return None
 
     async def _llm_result_check(
-        self, question: str, sql: str, columns: List[str], values: List[Any]
+        self,
+        question: str,
+        sql: str,
+        columns: List[str],
+        values: List[Any],
+        total_rows: Optional[int] = None,
     ) -> Tuple[bool, Optional[str]]:
         """用 LLM 校验 SQL 与执行结果是否完整满足用户问题的要求。
 
@@ -459,6 +545,9 @@ class DataScientistAgent(ConversableAgent):
         判定从严把握"错才判错"：只有能明确指出具体问题点、并给出可执行改法时才判
         不通过；否则一律判通过。LLM 不可用或校验结果解析失败时按"通过"处理，
         不阻塞主流程。
+
+        total_rows: 真实总行数（结果可能被截断展示，values 只是其中一部分），
+        缺省时按 len(values) 处理，避免把"展示行数"误报成"结果只有这么多行"。
         """
         user_question, schema_context = self._split_question_and_schema(question)
         preview_values = values[:20]
@@ -508,11 +597,16 @@ class DataScientistAgent(ConversableAgent):
             "只输出严格 JSON：{\"pass\": true 或 false, \"reason\": \"不通过时必须明确指出"
             "问题点并给出修改方法（中文）；通过时 reason 留空字符串\"}"
         )
+        # 结果可能超过展示上限被截断：总行数用真实值，另标出实际用于校验的行数
+        real_total = total_rows if total_rows and total_rows > 0 else len(values)
+        shown_scope = f"共 {real_total} 行"
+        if real_total > len(values):
+            shown_scope += f"，本次仅取前 {len(values)} 行用于校验"
         human_parts = [
             f"当前日期：{datetime.now().strftime('%Y-%m-%d')}",
             f"用户问题：{user_question}",
             f"生成的 SQL：\n{sql}",
-            f"执行结果（共 {len(values)} 行，预览前 {len(preview_values)} 行）：\n"
+            f"执行结果（{shown_scope}，其中预览前 {len(preview_values)} 行）：\n"
             f"{rows_preview}",
         ]
         if schema_context:
@@ -588,6 +682,32 @@ class DataScientistAgent(ConversableAgent):
             logger.warning(f"Request summary json failed: {e}")
             return None
 
+    @staticmethod
+    def _ensure_sample_scope_note(
+        thought: str, row_count: int, shown_rows: int, preview_rows: int
+    ) -> str:
+        """结论没说明样本范围时，按代码事实补一句，避免展示文本误导业务。
+
+        ⚠️ 数据说明 段允许省略，模型偶尔会整段省掉；此时业务会默认"表里展示的
+        行就是分析过的全部行"。展示行数小于真实总行数、或结论依据行数小于展示
+        行数时需要点明三者关系；模型已经写了总行数就不再补。
+        """
+        if row_count <= preview_rows or str(row_count) in thought:
+            return thought
+        if row_count > shown_rows:
+            note = (
+                f"本结论基于前 {preview_rows} 行生成；"
+                f"本次结果共 {row_count} 行，页面仅展示前 {shown_rows} 行。"
+            )
+        else:
+            note = (
+                f"本结论基于前 {preview_rows} 行生成；"
+                f"本次结果共 {row_count} 行，已全部展示。"
+            )
+        if "⚠️" in thought:
+            return f"{thought}{note}"
+        return f"{thought}\n\n⚠️ 数据说明\n{note}"
+
     async def _replace_result_summary(
         self,
         question: str,
@@ -603,6 +723,23 @@ class DataScientistAgent(ConversableAgent):
             displayed_rows = [dict(zip(columns, row)) for row in values]
         row_count = int(action_reply_obj.get("count") or len(displayed_rows))
         rows_preview = displayed_rows[:50]
+        # 样本范围是结论可靠性的前提：三个行数都是代码事实——真实总行数、
+        # 随结果下发给用户的行数（展示有上限）、实际喂给模型生成结论的行数。
+        # 三者不一致时必须让模型知道，否则它会把展示行数当成完整结果。
+        shown_rows = len(displayed_rows)
+        preview_rows = len(rows_preview)
+        if row_count > shown_rows:
+            sample_scope = (
+                f"共 {row_count} 行；其中前 {shown_rows} 行随结果展示给用户"
+                f"（展示有上限，真实结果不止这些）；本结论仅基于前 {preview_rows} 行生成。"
+            )
+        elif row_count > preview_rows:
+            sample_scope = (
+                f"共 {row_count} 行，已全部展示给用户；"
+                f"本结论仅基于其中前 {preview_rows} 行生成。"
+            )
+        else:
+            sample_scope = f"共 {row_count} 行，已全部展示，并全部作为本结论依据。"
         # 与校验环节共用同一套拆分口径：标记写法若对不上就不会拆分，
         # 会把整段表结构当成"用户问题"传给结论模型，导致结论跑偏且浪费 token
         user_question, _ = self._split_question_and_schema(question)
@@ -611,6 +748,7 @@ class DataScientistAgent(ConversableAgent):
             f"用户问题：{user_question}\n\n"
             f"已执行 SQL：\n{sql}\n\n"
             f"结果总行数：{row_count}\n"
+            f"结果样本范围：{sample_scope}\n"
             f"真实结果预览（最多50行）：\n"
             f"{json.dumps(rows_preview, ensure_ascii=False, default=str)}"
         )
@@ -636,6 +774,9 @@ class DataScientistAgent(ConversableAgent):
             thought = thought or fallback
             if not thought:
                 return
+            thought = self._ensure_sample_scope_note(
+                thought, row_count, shown_rows, preview_rows
+            )
 
             action_reply_obj["thought"] = thought
             action_out.content = json.dumps(action_reply_obj, ensure_ascii=False)
@@ -768,3 +909,71 @@ class DataScientistAgent(ConversableAgent):
         if suggestion:
             parts.append(f"改造建议：{suggestion}")
         return True, "；".join(parts)
+
+    @staticmethod
+    def _trim_sql_error(text: str) -> str:
+        """裁剪 SQLAlchemy 异常串，只保留数据库返回的核心报错。
+
+        原始串里 [SQL: ...] 会回显整条 SQL、[parameters: ...] 回显参数、末尾还有
+        sqlalche.me 文档链接，这些都是噪声；去掉它们并压缩空白，避免重试时把大段
+        无用内容塞进上下文干扰模型。
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        for pattern in (_SQL_ECHO_RE, _SQL_PARAMS_RE, _SQL_DOC_RE):
+            raw = pattern.sub("", raw)
+        return re.sub(r"\s+", " ", raw).strip()
+
+    @staticmethod
+    def _extract_sql_from_reply(text: str) -> str:
+        """从 LLM 原始回复里取 sql 字段。
+
+        SQL 执行失败时 ActionOutput.content 只有报错、不携带 SQL，只能从 LLM 回复
+        里取；取不到就返回空串，由诊断提示词仅依据报错信息判断。
+        """
+        raw = text or ""
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end <= start:
+            return ""
+        try:
+            obj = json.loads(raw[start : end + 1])
+        except Exception:
+            return ""
+        if not isinstance(obj, dict):
+            return ""
+        return str(obj.get("sql") or "")
+
+    async def _analyze_sql_error(
+        self, question: str, sql: str, error_desc: str
+    ) -> str:
+        """让大模型判断 SQL 为什么执行失败，返回给 Agent 的重试反馈。
+
+        不分简单/复杂，执行失败统一先做一次诊断：反馈用"报错原因 + 修正建议"，
+        而不是原始异常串。大模型不可用或输出解析失败时，退回裁剪后的原始报错，
+        保留原有重试行为。
+        """
+        trimmed = self._trim_sql_error(error_desc)
+        user_question, schema_context = self._split_question_and_schema(question)
+        human_parts = [
+            f"用户问题：{user_question}",
+            f"生成的 SQL：\n{sql or '(本轮未取到 SQL 文本，请仅依据报错信息判断)'}",
+            f"数据库报错：\n{trimmed or error_desc}",
+        ]
+        if schema_context:
+            human_parts.append(f"表结构/关联关系/取值参考：\n{schema_context}")
+        result = await self._call_llm_and_parse_json(
+            _SQL_ERROR_ANALYZE_PROMPT, "\n\n".join(human_parts)
+        )
+        if not result:
+            return trimmed or error_desc
+        cause = str(result.get("cause") or "").strip()
+        suggestion = str(result.get("suggestion") or "").strip()
+        if not cause and not suggestion:
+            return trimmed or error_desc
+        parts = []
+        if cause:
+            parts.append(f"报错原因：{cause}")
+        if suggestion:
+            parts.append(f"修正建议：{suggestion}")
+        return "本次 SQL 执行失败。" + "；".join(parts)
