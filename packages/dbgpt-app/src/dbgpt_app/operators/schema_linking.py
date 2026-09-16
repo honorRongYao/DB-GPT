@@ -1286,6 +1286,22 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         text = str(value)
         return text[:20] + "..." if len(text) > 20 else text
 
+    @staticmethod
+    def _row_cell(row: Any, key: str, index: int = 0) -> Any:
+        """按列名（dict 行）或列位置（list/tuple/SQLAlchemy Row）取单个单元格。
+
+        RDBMSConnector._query 会把列名作为首行插入，取到列名本身的行视为表头，返回 None；
+        越界或类型异常同样返回 None，由调用方决定跳过。
+        """
+        if isinstance(row, dict):
+            return row.get(key)
+        try:
+            if row and row[index] != key:
+                return row[index]
+        except (IndexError, TypeError, KeyError):
+            pass
+        return None
+
     async def _enumerate_field_values(
         self, connector, table_name: str, fields: List[str], limit: int
     ) -> List[List[str]]:
@@ -1361,18 +1377,10 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         semantics: dict = {}
         wanted = set(table_names)
         for row in rows:
-            if isinstance(row, dict):
-                t_name = row.get("table")
-                t_sem = row.get("semantic")
-            else:
-                # list/tuple 或 SQLAlchemy Row 对象；RDBMSConnector._query 会把列名
-                # 作为首行插入，首列等于表头名 "table" 的行视为表头跳过
-                try:
-                    if row[0] == "table":
-                        continue
-                    t_name, t_sem = row[0], row[1]
-                except (IndexError, TypeError, KeyError):
-                    continue
+            # 非 dict 行若首列等于列名，说明该行是 RDBMSConnector._query 插入的表头行，
+            # _row_cell 会返回 None，下方按"表名不在待查集合"自然跳过
+            t_name = self._row_cell(row, "table", 0)
+            t_sem = self._row_cell(row, "semantic", 1)
             if t_name in wanted and t_sem:
                 texts = semantics.setdefault(str(t_name), [])
                 text = str(t_sem)
@@ -1731,12 +1739,7 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             logger.warning(f"Semantic anchor query failed, skip: {e}")
             return None
         for row in rows:
-            if isinstance(row, dict):
-                value = row.get("raw_data")
-            elif row and row[0] != "raw_data":
-                value = row[0]
-            else:
-                continue
+            value = self._row_cell(row, "raw_data")
             if value:
                 return str(value)
         return None
@@ -1887,12 +1890,7 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             return []
         values = []
         for row in rows:
-            if isinstance(row, dict):
-                value = row.get("category_1")
-            elif row and row[0] != "category_1":
-                value = row[0]
-            else:
-                continue
+            value = self._row_cell(row, "category_1")
             if value:
                 values.append(str(value))
         return values
@@ -2016,6 +2014,27 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         return list(paths)
 
     @staticmethod
+    def _render_category_whitelist_sql(item: dict, table_allowed: bool) -> str:
+        """渲染品类白名单：来源表在允许表内时给原 SQL，否则降级为取值清单。
+
+        白名单是已定稿的过滤条件，不随选表结果摇摆；但来源表 dim_product_category
+        未被选入允许表时，原 SQL 的 FROM 会引用一张禁用表，让模型左右为难。
+        降级成取值清单后，业务表自身的 category_id 外键即可直接使用。
+        """
+        if table_allowed:
+            return item.get("sql") or ""
+        ids = [
+            str(path.get("category_id"))
+            for path in item.get("category_paths") or []
+            if path.get("category_id") is not None
+        ]
+        return (
+            f"-- 关键词:{item.get('keyword')} 品类白名单（取值来自 dim_product_category，"
+            "该表本次不在允许表内，请直接用在业务表的 category_id 上）\n"
+            f"category_id IN ({', '.join(ids)})"
+        )
+
+    @staticmethod
     def _build_recall_rows_text(
         recall_items: List[dict], catalog_comments: dict
     ) -> str:
@@ -2064,6 +2083,20 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             "drop_recalls": drop_recalls,
         }
 
+    async def _complete_verify_json(
+        self, prompt: str, question: str, label: str
+    ) -> dict:
+        """调 LLM 做一次校验并解析 JSON：失败重试 1 次，仍失败抛异常由调用方降级。"""
+        last_err = ""
+        for attempt in range(1, 3):
+            try:
+                output = await self._llm_complete(prompt, f"用户问题：{question}")
+                return self._parse_merge_verify_result(output)
+            except Exception as e:
+                last_err = str(e)
+                logger.warning(f"{label} attempt {attempt}/2 failed: {last_err}")
+        raise RuntimeError(f"{label} failed after retry: {last_err}")
+
     async def _run_table_verify(
         self,
         question: str,
@@ -2094,15 +2127,7 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             selected_schemas="\n".join(schema_lines),
             table_catalog="\n".join(f"- {item}" for item in catalog),
         )
-        last_err = ""
-        for attempt in range(1, 3):
-            try:
-                output = await self._llm_complete(prompt, f"用户问题：{question}")
-                return self._parse_merge_verify_result(output)
-            except Exception as e:
-                last_err = str(e)
-                logger.warning(f"Table verify attempt {attempt}/2 failed: {last_err}")
-        raise RuntimeError(f"Table verify failed after retry: {last_err}")
+        return await self._complete_verify_json(prompt, question, "Table verify")
 
     async def _run_recall_verify(
         self,
@@ -2122,15 +2147,207 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                 or "（无向量召回）"
             ),
         )
-        last_err = ""
-        for attempt in range(1, 3):
-            try:
-                output = await self._llm_complete(prompt, f"用户问题：{question}")
-                return self._parse_merge_verify_result(output)
-            except Exception as e:
-                last_err = str(e)
-                logger.warning(f"Recall verify attempt {attempt}/2 failed: {last_err}")
-        raise RuntimeError(f"Recall verify failed after retry: {last_err}")
+        return await self._complete_verify_json(prompt, question, "Recall verify")
+
+    def _merge_candidate_tables(
+        self,
+        selected_names: List[str],
+        recall_items: List[dict],
+        catalog_tables: set,
+    ) -> Tuple[List[str], List[str]]:
+        """组候选表 = LLM 自选 + 召回来源表；返回 (候选表, 仅由召回带入的表)。
+
+        category_embedding 是内部向量表，永不进候选；候选为空时兜底用目录表。
+        """
+        candidate_names = list(selected_names)
+        recall_only_names = []
+        for item in recall_items:
+            table = item.get("table") or ""
+            if not table or table == TARGET_TABLE or table not in catalog_tables:
+                continue
+            if table not in candidate_names:
+                candidate_names.append(table)
+                recall_only_names.append(table)
+        if not candidate_names:
+            logger.warning("No valid tables selected, fallback to catalog tables")
+            candidate_names = [
+                t for t in catalog_tables if t != TARGET_TABLE
+            ][: self._max_selected_tables]
+        return candidate_names, recall_only_names
+
+    def _apply_table_verify_actions(
+        self,
+        table_actions: dict,
+        candidate_names: List[str],
+        catalog_tables: set,
+    ) -> Tuple[set, List[str], List[str]]:
+        """把表级校验动作落到表集合上，返回 (待剔除表, 补充表, 中间允许表)。
+
+        补充表受 _max_selected_tables 约束（最终表数 = 候选保留数 + 补表数），
+        避免 LLM 一次补过多表，导致字段加载次数与提示词长度失控。
+        """
+        drop_names = {
+            t
+            for t in table_actions["drop_tables"]
+            if t and t != TARGET_TABLE and t in candidate_names
+        }
+        kept_count = len([t for t in candidate_names if t not in drop_names])
+        missing_quota = max(0, self._max_selected_tables - kept_count)
+        missing_tables = []
+        for t in table_actions["missing_tables"]:
+            if not t or t == TARGET_TABLE or t not in catalog_tables:
+                continue
+            if t in candidate_names or t in missing_tables:
+                continue
+            if len(missing_tables) >= missing_quota:
+                logger.info(
+                    f"Missing tables exceed max_selected_tables="
+                    f"{self._max_selected_tables}, ignore rest: {t}"
+                )
+                break
+            missing_tables.append(t)
+        if drop_names:
+            logger.info(f"Table verify dropped tables: {sorted(drop_names)}")
+        allowed_names = [t for t in candidate_names if t not in drop_names]
+        allowed_names.extend(missing_tables)
+        return drop_names, missing_tables, allowed_names
+
+    async def _finalize_tables(
+        self,
+        allowed_names: List[str],
+        recall_only_names: List[str],
+        recall_items: List[dict],
+        drop_recalls: set,
+        drop_names: set,
+        columns_by_table: dict,
+        connector,
+    ) -> Tuple[List[str], dict]:
+        """召回全被剔的"召回专用表"出局，得到最终允许表并补齐缺失字段。"""
+        for table in recall_only_names:
+            recall_idx = [
+                item["idx"] for item in recall_items if item.get("table") == table
+            ]
+            if recall_idx and all(i in drop_recalls for i in recall_idx):
+                drop_names.add(table)
+        final_names = [t for t in allowed_names if t not in drop_names]
+        for table in final_names:
+            if table not in columns_by_table:
+                columns_by_table[table] = await self._get_columns_with_fallback(
+                    connector, table
+                )
+        columns_by_table = {
+            table: columns_by_table[table]
+            for table in final_names
+            if table in columns_by_table
+        }
+        return final_names, columns_by_table
+
+    @staticmethod
+    def _filter_kept_recalls(
+        recall_items: List[dict], drop_recalls: set, final_names: List[str]
+    ) -> List[dict]:
+        """保留的召回 SQL：未被审核点名剔除，且来源表仍在最终允许表内（同生共死）。"""
+        kept_items = []
+        for item in recall_items:
+            if item.get("idx") in drop_recalls:
+                continue
+            table = item.get("table") or ""
+            if table and table not in final_names:
+                continue
+            kept_items.append(item)
+        if kept_items:
+            logger.info(
+                "Keep %d recall sqls: %s",
+                len(kept_items),
+                [f"{i['idx']}. {i['table']}/{i['columns']}" for i in kept_items],
+            )
+        return kept_items
+
+    @staticmethod
+    def _build_selected_text(
+        final_names: List[str],
+        selected: List[dict],
+        recall_only_names: List[str],
+        missing_tables: List[str],
+    ) -> str:
+        """按最终允许表重算"表 + 关联关系"文本，避免被剔表残留在提示词里。"""
+        relation_by_table = {}
+        for item in selected:
+            name = item["table"]
+            if name in final_names:
+                relation_by_table[name] = item.get("relation") or ""
+        for table in final_names:
+            if table in relation_by_table:
+                continue
+            relation_by_table[table] = (
+                "向量召回命中的来源业务表：可按召回 SQL 输出的主键值做实体过滤/关联"
+                if table in recall_only_names
+                else ""
+            )
+        for table in missing_tables:
+            relation_by_table[table] = "合并校验补充：用于表达问题中缺失的过滤维度"
+        if not final_names:
+            return "- (无可用表)"
+        return "\n".join(
+            f"- {table}"
+            + (
+                f" -- 关联: {relation_by_table[table]}"
+                if relation_by_table.get(table)
+                else ""
+            )
+            for table in final_names
+        )
+
+    def _build_recall_context(
+        self, final_names: List[str], recall_items: List[dict], kept_items: List[dict]
+    ) -> str:
+        """组装召回引导：品类白名单 + 其余召回来源 SQL；两者皆空时返回空串。
+
+        品类白名单与选表结果解耦：白名单是已定稿的过滤条件，只要清洗出了品类路径就必须
+        注入（来源表未被选入时降级为取值清单）；普通召回被全剔时也必须注入，否则 Agent
+        只能靠 LIKE 或自行枚举值兜底。
+        """
+        category_items = [i for i in recall_items if i.get("category_paths")]
+        other_items = [i for i in kept_items if not i.get("category_paths")]
+        if not category_items and not other_items:
+            return ""
+        recall_parts = []
+        if category_items:
+            path_lines = []
+            for item in category_items:
+                for path in item["category_paths"]:
+                    full_path = " > ".join(
+                        str(path.get(f"category_{level}") or "")
+                        for level in range(1, 5)
+                    )
+                    path_lines.append(
+                        f"- 关键词 {item.get('keyword')}：category_id="
+                        f"{path.get('category_id')}；完整路径={full_path}"
+                    )
+            recall_parts.append(
+                "LLM 已按完整 category_1～category_4 路径审核以下品类。"
+                "涉及目标品类时，只允许使用这些 category_id，禁止增加其他品类、"
+                "恢复原向量子查询或自行模糊匹配：\n"
+                + "\n".join(path_lines)
+                + "\n\n清洗后的品类白名单 SQL：\n"
+                + "\n\n".join(
+                    self._render_category_whitelist_sql(
+                        item,
+                        not item.get("table") or item["table"] in final_names,
+                    )
+                    for item in category_items
+                )
+            )
+        if other_items:
+            recall_parts.append(
+                "以下召回 SQL 输出来源业务表的标识列真实取值，用于 WHERE 或关联；"
+                "不要改动向量阈值与子查询。复合主键必须逐列匹配。"
+                "category_embedding 是内部向量表，禁止在业务 SQL 中"
+                "直接查询或关联。\n\n"
+                "其他关键词向量召回来源 SQL：\n"
+                + "\n\n".join(item["sql"] for item in other_items)
+            )
+        return "\n\n关键词向量召回结果：\n" + "\n\n".join(recall_parts)
 
     async def map(self, input_value: AgentGenerateContext) -> AgentGenerateContext:
         """单轮语义层：选表+校验后把最终表结构与保留的召回 SQL 注入用户消息原样透传。
@@ -2213,20 +2430,9 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         )
 
         # step7 组候选 = LLM 自选 + 召回来源表（recall_only）；category_embedding 永不进候选/允许表
-        candidate_names = list(selected_names)
-        recall_only_names = []
-        for item in recall_items:
-            table = item.get("table") or ""
-            if not table or table == TARGET_TABLE or table not in catalog_tables:
-                continue
-            if table not in candidate_names:
-                candidate_names.append(table)
-                recall_only_names.append(table)
-        if not candidate_names:
-            logger.warning("No valid tables selected, fallback to catalog tables")
-            candidate_names = [
-                t for t in catalog_tables if t != TARGET_TABLE
-            ][: self._max_selected_tables]
+        candidate_names, recall_only_names = self._merge_candidate_tables(
+            selected_names, recall_items, catalog_tables
+        )
 
         # step8 加载候选表完整字段（类型/主键/注释）
         connector = self._datasource.connector
@@ -2258,34 +2464,10 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                 "drop_tables": list(recall_only_names),
             }
 
-        # 应用表级动作 → drop_names / missing_tables
-        drop_names = {
-            t
-            for t in table_actions["drop_tables"]
-            if t and t != TARGET_TABLE and t in candidate_names
-        }
-        # 补表受 _max_selected_tables 约束（最终表数 = 候选保留数 + 补表数）：
-        # 避免 LLM 一次补过多表，导致字段加载次数与提示词长度失控
-        kept_count = len([t for t in candidate_names if t not in drop_names])
-        missing_quota = max(0, self._max_selected_tables - kept_count)
-        missing_tables = []
-        for t in table_actions["missing_tables"]:
-            if not t or t == TARGET_TABLE or t not in catalog_tables:
-                continue
-            if t in candidate_names or t in missing_tables:
-                continue
-            if len(missing_tables) >= missing_quota:
-                logger.info(
-                    f"Missing tables exceed max_selected_tables="
-                    f"{self._max_selected_tables}, ignore rest: {t}"
-                )
-                break
-            missing_tables.append(t)
-        if drop_names:
-            logger.info(f"Table verify dropped tables: {sorted(drop_names)}")
-        # 中间允许表 = 候选 - 表级剔除 + 补充表，作为 step9b 召回审核的口径参照
-        allowed_names = [t for t in candidate_names if t not in drop_names]
-        allowed_names.extend(missing_tables)
+        # 应用表级动作 → 待剔除表 / 补充表 / 中间允许表（作为 step9b 召回审核的口径参照）
+        drop_names, missing_tables, allowed_names = self._apply_table_verify_actions(
+            table_actions, candidate_names, catalog_tables
+        )
 
         # step9b 召回审核：按序号剔无意义召回（失败内部已重试，仍失败只留 LLM 自选表的召回）
         recall_actions = {"drop_recalls": set()}
@@ -2325,28 +2507,16 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                 sorted(recall_actions["drop_recalls"]),
             )
 
-        # step9.5 绑定规则：recall_only 表召回全部被剔 → 出局
-        for table in recall_only_names:
-            recall_idx = [
-                item["idx"] for item in recall_items if item.get("table") == table
-            ]
-            if recall_idx and all(
-                i in recall_actions["drop_recalls"] for i in recall_idx
-            ):
-                drop_names.add(table)
-
-        # step9.5 最终允许表 = 中间允许表 - 出局表 + 补充表；补充表此刻补加载字段
-        final_names = [t for t in allowed_names if t not in drop_names]
-        for table in final_names:
-            if table not in columns_by_table:
-                columns_by_table[table] = await self._get_columns_with_fallback(
-                    connector, table
-                )
-        columns_by_table = {
-            table: columns_by_table[table]
-            for table in final_names
-            if table in columns_by_table
-        }
+        # step9.5 绑定规则 + 定表：recall_only 表召回全被剔则出局，补充表此刻补加载字段
+        final_names, columns_by_table = await self._finalize_tables(
+            allowed_names,
+            recall_only_names,
+            recall_items,
+            recall_actions["drop_recalls"],
+            drop_names,
+            columns_by_table,
+            connector,
+        )
         # step9.5 结束 -> 上报阶段进度（第 5 步：候选表/召回来源表相关性校验）
         dropped_txt = (
             f"，剔除 {len(drop_names)} 张无关/不再适用的表" if drop_names else ""
@@ -2358,21 +2528,9 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             f"{dropped_txt}{missing_txt}，最终确定 {len(final_names)} 张可用表",
         )
 
-        # 保留的召回 SQL：未被 drop_recalls 点名 且 其来源表 ∈ final_tables（同生共死）
-        kept_items = []
-        for item in recall_items:
-            if item.get("idx") in recall_actions["drop_recalls"]:
-                continue
-            table = item.get("table") or ""
-            if table and table not in final_names:
-                continue
-            kept_items.append(item)
-        if kept_items:
-            logger.info(
-                "Keep %d recall sqls: %s",
-                len(kept_items),
-                [f"{i['idx']}. {i['table']}/{i['columns']}" for i in kept_items],
-            )
+        kept_items = self._filter_kept_recalls(
+            recall_items, recall_actions["drop_recalls"], final_names
+        )
         # step9 结束（表级校验 + 召回审核 + 绑定规则）-> 上报阶段进度（第 6 步：召回 SQL 复核）
         recall_total = len(recall_items)
         if recall_total:
@@ -2390,34 +2548,9 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             )
 
         # 按最终允许表重算 selected_text，避免被剔表残留在提示词里
-        relation_by_table = {}
-        for item in selected:
-            name = item["table"]
-            if name in final_names:
-                relation_by_table[name] = item.get("relation") or ""
-        for table in final_names:
-            if table in relation_by_table:
-                continue
-            if table in recall_only_names:
-                relation_by_table[table] = (
-                    "向量召回命中的来源业务表：可按召回 SQL 输出的主键值做实体过滤/关联"
-                )
-            else:
-                relation_by_table[table] = ""
-        for table in missing_tables:
-            relation_by_table[table] = "合并校验补充：用于表达问题中缺失的过滤维度"
-        if final_names:
-            selected_text = "\n".join(
-                f"- {table}"
-                + (
-                    f" -- 关联: {relation_by_table[table]}"
-                    if relation_by_table.get(table)
-                    else ""
-                )
-                for table in final_names
-            )
-        else:
-            selected_text = "- (无可用表)"
+        selected_text = self._build_selected_text(
+            final_names, selected, recall_only_names, missing_tables
+        )
 
         # step10-12 值域字段：确认 -> 过滤编造列名 -> 查真实取值校验并补字段
         value_fields_map = await self._select_value_fields(question, columns_by_table)
@@ -2455,50 +2588,9 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         schemas_text = await self._build_schemas_text(
             final_names, catalog_comments, columns_by_table, value_fields_map
         )
-        recall_context = ""
-        # 品类白名单与召回审核解耦：定稿项只取决于"来源表是否仍在允许表内"，
-        # 普通召回被全剔时也必须注入——白名单丢了，Agent 就只能靠 LIKE 或自行枚举值兜底。
-        category_items = [
-            item
-            for item in recall_items
-            if item.get("category_paths")
-            and (not item.get("table") or item["table"] in final_names)
-        ]
-        other_items = [item for item in kept_items if not item.get("category_paths")]
-        if category_items or other_items:
-            recall_parts = []
-            if category_items:
-                path_lines = []
-                for item in category_items:
-                    for path in item["category_paths"]:
-                        full_path = " > ".join(
-                            str(path.get(f"category_{level}") or "")
-                            for level in range(1, 5)
-                        )
-                        path_lines.append(
-                            f"- 关键词 {item.get('keyword')}：category_id="
-                            f"{path.get('category_id')}；完整路径={full_path}"
-                        )
-                recall_parts.append(
-                    "LLM 已按完整 category_1～category_4 路径审核以下品类。"
-                    "涉及目标品类时，只允许使用这些 category_id，禁止增加其他品类、"
-                    "恢复原向量子查询或自行模糊匹配：\n"
-                    + "\n".join(path_lines)
-                    + "\n\n清洗后的品类白名单 SQL：\n"
-                    + "\n\n".join(item["sql"] for item in category_items)
-                )
-            if other_items:
-                recall_parts.append(
-                    "以下召回 SQL 输出来源业务表的标识列真实取值，用于 WHERE 或关联；"
-                    "不要改动向量阈值与子查询。复合主键必须逐列匹配。"
-                    "category_embedding 是内部向量表，禁止在业务 SQL 中"
-                    "直接查询或关联。\n\n"
-                    "其他关键词向量召回来源 SQL：\n"
-                    + "\n\n".join(item["sql"] for item in other_items)
-                )
-            recall_context = "\n\n关键词向量召回结果：\n" + "\n\n".join(
-                recall_parts
-            )
+        recall_context = self._build_recall_context(
+            final_names, recall_items, kept_items
+        )
 
         # step14 组装 user 消息：允许表 + 完整表结构 + 召回来源 SQL + 用户问题
         input_value.message.content = (
