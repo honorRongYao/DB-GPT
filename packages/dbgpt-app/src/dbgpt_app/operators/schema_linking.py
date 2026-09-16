@@ -224,6 +224,26 @@ _DEFAULT_CATEGORY_PATH_CLEAN_PROMPT = """你是品类召回结果审核员。请
 # 注意不能传 0：下游 OpenAI 兼容客户端是 `if request.temperature:`，0 会被当假值丢掉。
 _CATEGORY_CLEAN_TEMPERATURE = 0.01
 
+# dim_product_category.is_parts 标识品类是否为配件，库里只有 '0'（否）与 '1'（是）
+# 两种取值，不做多口径兼容。
+_PARTS_VALUE_TRUE = "1"
+
+_DEFAULT_PARTS_FILTER_PROMPT = """你是电商数据分析助手。下面是用户的数据分析问题：
+
+用户问题：{question}
+
+判断用户是否在问"配件/附件/零件"类的数据。
+
+判断规则：
+1. 明确提到配件、附件、零件、备件、耗材、替换件等词，或直接指向某个配件品类
+   （如刀片、机油、滤网、集草袋、充电器），输出 true；
+2. 只提到产品主体（如割草机、咖啡机、吸尘器），或提到主机、整机、非配件，输出 false；
+3. 判断不了时输出 false。
+
+只输出严格 JSON，不要任何解释文字：
+{{"need_parts": true 或 false}}
+"""
+
 _DEFAULT_RECALL_VERIFY_PROMPT = """你是数据库专家。这是"召回审核"（表级校验后的第二步）：逐条判断每条"关键词向量召回"对回答用户问题是否有意义，无意义的序号放入 drop_recalls。
 
 用户问题：{question}
@@ -1764,6 +1784,52 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             for level in levels
         )
 
+    @staticmethod
+    def _is_parts_path(path: dict) -> bool:
+        """该品类路径是否属于配件品类（库里 is_parts 取值为 '1'）。"""
+        value = path.get("is_parts")
+        if value is None:
+            return False
+        return str(value).strip() == _PARTS_VALUE_TRUE
+
+    async def _should_filter_parts(self, question: str) -> bool:
+        """让模型判断是否该在品类白名单里剔掉配件路径。
+
+        返回 True 表示用户没在问配件，调用侧据此剔掉 is_parts 为 '1' 的路径。
+        调用/解析失败返回 False（不剔除）：与召回审核"宁可范围宽，也不丢整条召回"
+        的兜底一致，避免误删。
+        """
+        prompt = _DEFAULT_PARTS_FILTER_PROMPT.format(question=question or "")
+        for attempt in range(1, 3):  # 首次尝试 + 重试 1 次
+            try:
+                output = await self._llm_complete(
+                    prompt,
+                    "请判断用户问题是否需要配件数据。",
+                    temperature=_CATEGORY_CLEAN_TEMPERATURE,
+                )
+                data = self._parse_json_strict(output)
+                need_parts = data.get("need_parts")
+                # 只认 JSON 布尔值：字符串 "false"、数字 0 之类一律按解析失败重试，
+                # 避免 bool("false") 为真这类误判。
+                if not isinstance(need_parts, bool):
+                    raise ValueError(f"need_parts 不是布尔值: {need_parts!r}")
+                logger.info(
+                    "Parts filter decision: need_parts=%s, question=%s",
+                    need_parts,
+                    question,
+                )
+                return not need_parts
+            except Exception as e:
+                logger.warning(
+                    "Decide parts filter attempt %d/2 failed (%s), retrying",
+                    attempt,
+                    e,
+                )
+        logger.warning(
+            "Decide parts filter failed after retry, keep all category paths"
+        )
+        return False
+
     async def _clean_category_recall_items(
         self, question: str, recall_items: List[dict]
     ) -> List[dict]:
@@ -1775,6 +1841,13 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         """
         cleaned_items = []
         category_1_values = await self._list_category_1_values()
+        # 是否剔配件由模型判断，整条问题只判一次；没有品类召回项时不必调用模型
+        has_category_item = any(
+            item.get("table") == "dim_product_category" for item in recall_items
+        )
+        filter_parts = (
+            await self._should_filter_parts(question) if has_category_item else False
+        )
         for item in recall_items:
             if item.get("table") != "dim_product_category":
                 cleaned_items.append(item)
@@ -1795,7 +1868,8 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                 keyword = item.get("keyword") or ""
                 paths_sql = (
                     "SELECT DISTINCT t1.`category_id`, t1.`category_1`, "
-                    "t1.`category_2`, t1.`category_3`, t1.`category_4` "
+                    "t1.`category_2`, t1.`category_3`, t1.`category_4`, "
+                    "t1.`is_parts` "
                     "FROM `voc_ai_test`.`dim_product_category` AS t1 "
                     "INNER JOIN (SELECT DISTINCT `raw_data` "
                     "FROM `voc_ai_test`.`category_embedding` "
@@ -1818,6 +1892,7 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                     "category_2",
                     "category_3",
                     "category_4",
+                    "is_parts",
                 ]
                 for row in rows:
                     if isinstance(row, dict):
@@ -1832,6 +1907,15 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                     paths.append(path)
                 if not paths:
                     continue
+                # 模型判定用户没在问配件：先把配件路径剔出候选，白名单就不会再和表
+                # 语义里的 is_parts=0 规则打架。剔完为空则保留原候选（宁可范围宽，
+                # 也不丢整条召回）。
+                if filter_parts:
+                    non_parts_paths = [
+                        path for path in paths if not self._is_parts_path(path)
+                    ]
+                    if non_parts_paths:
+                        paths = non_parts_paths
                 kept_paths = await self._select_category_paths(
                     question, keyword, paths, columns, category_1_values
                 )
@@ -2313,23 +2397,10 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             return ""
         recall_parts = []
         if category_items:
-            path_lines = []
-            for item in category_items:
-                for path in item["category_paths"]:
-                    full_path = " > ".join(
-                        str(path.get(f"category_{level}") or "")
-                        for level in range(1, 5)
-                    )
-                    path_lines.append(
-                        f"- 关键词 {item.get('keyword')}：category_id="
-                        f"{path.get('category_id')}；完整路径={full_path}"
-                    )
             recall_parts.append(
-                "LLM 已按完整 category_1～category_4 路径审核以下品类。"
-                "涉及目标品类时，只允许使用这些 category_id，禁止增加其他品类、"
-                "恢复原向量子查询或自行模糊匹配：\n"
-                + "\n".join(path_lines)
-                + "\n\n清洗后的品类白名单 SQL：\n"
+                "涉及目标品类时，只允许使用以下 category_id，禁止增加其他品类、"
+                "恢复原向量子查询或自行模糊匹配。\n\n"
+                "清洗后的品类白名单 SQL：\n"
                 + "\n\n".join(
                     self._render_category_whitelist_sql(
                         item,
