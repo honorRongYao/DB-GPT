@@ -105,6 +105,30 @@ class ServeDao(BaseDao[ServeEntity, ServeRequest, ServerResponse]):
             )
             return MessageStorageItem(entity.conv_uid, entity.index, message_detail)
 
+    def get_message_times(self, conv_uid: str) -> Dict[int, str]:
+        """按消息 index 返回各条消息的落库时间。
+
+        会话消息对象本身不带时间字段（BaseMessage 只有 content/index/
+        round_index/additional_kwargs），时间只存在于 chat_history_message 的
+        gmt_created，所以这里单独查一次供上层回填 MessageVo.time_stamp。
+        同一轮问答的两条消息是同一次落库，gmt_created 相同，故该时间是"轮次
+        时间"，区分不出提问时刻与回答时刻。
+        """
+        with self.session(commit=False) as session:
+            rows = (
+                session.query(
+                    ChatHistoryMessageEntity.index,
+                    ChatHistoryMessageEntity.gmt_created,
+                )
+                .filter(ChatHistoryMessageEntity.conv_uid == conv_uid)
+                .all()
+            )
+        return {
+            index: gmt_created.strftime("%Y-%m-%d %H:%M:%S")
+            for index, gmt_created in rows
+            if gmt_created is not None
+        }
+
     def _parse_old_messages(self, entity: ServeEntity) -> List[Dict[str, Any]]:
         """Parse the old messages
 

@@ -207,6 +207,8 @@ class Service(BaseService[ServeEntity, ServeRequest, ServerResponse]):
 
         feedbacks = feedback_service.list_conv_feedbacks(conv_uid=request.conv_uid)
         fb_map = {fb.message_id: fb.to_dict() for fb in feedbacks}
+        # 消息对象不带时间，时间只在 chat_history_message.gmt_created，按 index 回填
+        message_times = self.dao.get_message_times(request.conv_uid)
 
         for msg in messages:
             feedback = {}
@@ -223,6 +225,7 @@ class Service(BaseService[ServeEntity, ServeRequest, ServerResponse]):
                         msg.get_view_markdown_text(file_serve.replace_uri)
                     ),
                     order=msg.round_index,
+                    time_stamp=message_times.get(msg.index),
                     model_name=self.config.default_model,
                     feedback=feedback,
                 )
