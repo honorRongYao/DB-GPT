@@ -1745,26 +1745,30 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
     def _match_category_keyword(
         path: dict, keyword: str, levels: Tuple[int, ...] = (2, 3, 4)
     ) -> bool:
-        """关键词与指定品类层级等值命中，视为确定匹配。
+        """关键词与指定品类层级模糊命中（层级值包含关键词），视为确定匹配。
 
-        只做等值对齐、不做包含匹配：包含匹配会把"电动牙刷头""旅行盒"
-        也算成"电动牙刷"的命中，判定同样不可预期。
+        单向包含：只判"库里的层级值包含关键词"（如"电动牙刷"命中"声波电动牙刷"），
+        不反向匹配。库里的层级值常带修饰词（声波/旋转式/便携等），等值对齐会把本该
+        归属该品类的路径漏掉，只能退到语义模型或向量锚，结果不稳定。
+        代价是关键词越短越容易连带命中其他品类（如"牙刷"会命中"牙刷头""牙刷架"），
+        调用侧需保证关键词是足够具体的品类词。
         """
-        kw = (keyword or "").strip()
+        kw = (keyword or "").strip().lower()
         if not kw:
             return False
         return any(
-            str(path.get(f"category_{level}") or "").strip() == kw
+            kw in str(path.get(f"category_{level}") or "").strip().lower()
             for level in levels
         )
 
     async def _clean_category_recall_items(
         self, question: str, recall_items: List[dict]
     ) -> List[dict]:
-        """清洗品类召回：整值命中走规则，库里没有该词时才让模型做语义判断。
+        """清洗品类召回：候选里能模糊命中关键词就走规则，命不中才让模型做语义判断。
 
-        等值命中（如"冰箱"）本身就是确定答案，不需要也不应该交给模型；库里没有
-        该词时（如"牙刷""洗牙器"）才由模型在候选里挑，模型不可用再回退语义锚。
+        层级值包含关键词（如"冰箱""电动牙刷"命中"声波电动牙刷"）本身就是确定答案，
+        不需要也不应该交给模型；候选里找不到包含该词的层级值时（如"牙刷""洗牙器"）
+        才由模型在候选里挑，模型不可用再回退语义锚。
         """
         cleaned_items = []
         category_1_values = await self._list_category_1_values()
@@ -1917,11 +1921,11 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
         columns: List[str],
         category_1_values: List[str],
     ) -> List[dict]:
-        """选保留的品类路径：整值命中的走规则，命中不了的才让模型做语义判断。
+        """选保留的品类路径：候选里能模糊命中的走规则，命不中的才让模型做语义判断。
 
-        库里已有该关键词时，等值命中就是确定答案，交给模型只会把真实命中的路径
-        砍掉（如"冰箱"下只保留 3/6 个）且输出不稳定；库里没有该词时（如"牙刷"
-        "洗牙器"）等值对齐给不出正确答案，才需要模型的语义判断。
+        候选里已有包含该关键词的层级值时，模糊命中就是确定答案，交给模型只会把真实
+        命中的路径砍掉（如"冰箱"下只保留 3/6 个）且输出不稳定；候选中没有包含该词的
+        层级值时（如"牙刷""洗牙器"）模糊对齐给不出正确答案，才需要模型的语义判断。
         """
         kept_paths = [
             path for path in paths if self._match_category_keyword(path, keyword)
