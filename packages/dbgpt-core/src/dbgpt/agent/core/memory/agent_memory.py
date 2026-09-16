@@ -24,6 +24,13 @@ from .gpts import GptsMemory, GptsMessageMemory, GptsPlansMemory
 
 logger = logging.getLogger(__name__)
 
+# 记忆片段算向量前的兜底：observation 为空会让部分 embedding 服务直接 400
+# （如 vLLM 的 bge-m3 对 input=[null] 报校验错误），过长又会撞上服务端上下文
+# 上限（同一部署 max_model_len=4096，超一点就返回 "passed N input tokens"）。
+# 这里换占位文本并按字符截断，只影响送去算向量的文本，落库内容仍是原文。
+_EMPTY_OBSERVATION_PLACEHOLDER = "空记忆片段"
+_MAX_EMBEDDING_CHARS = 3000
+
 
 class StructuredObservation(TypedDict, total=False):
     """Structured observation for agent memory."""
@@ -98,7 +105,10 @@ class AgentMemoryFragment(MemoryFragment):
         Returns:
             List[float]: Embeddings of the memory fragment
         """
-        embeddings = embedding_func([self.observation])
+        # observation 为空或超长都会让 embedding 服务返回 400，先兜住再送算，
+        # 否则记忆写入失败会连带把本轮的 Agent 回复一起吞掉。
+        text = str(self.observation or "").strip() or _EMPTY_OBSERVATION_PLACEHOLDER
+        embeddings = embedding_func([text[:_MAX_EMBEDDING_CHARS]])
         return embeddings[0]
 
     @property

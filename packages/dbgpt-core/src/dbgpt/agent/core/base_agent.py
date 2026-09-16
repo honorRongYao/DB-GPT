@@ -742,24 +742,38 @@ class ConversableAgent(Role, Agent):
                         break
                     fail_reason = reason
                     observation = fail_reason
-                    await self.write_memories(
-                        question=question,
-                        ai_message=ai_message,
-                        action_output=act_out,
-                        check_pass=check_pass,
-                        check_fail_reason=fail_reason,
-                        current_retry_counter=current_retry_counter,
-                    )
+                    # 记忆写入失败（如 embedding 服务 400、超时）不能影响本轮回复：
+                    # 异常若冒泡到外层 except，会把异常字符串直接当成回答返回。
+                    try:
+                        await self.write_memories(
+                            question=question,
+                            ai_message=ai_message,
+                            action_output=act_out,
+                            check_pass=check_pass,
+                            check_fail_reason=fail_reason,
+                            current_retry_counter=current_retry_counter,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Agent {self.name} write memories failed, "
+                            f"skip memory of this round: {e}"
+                        )
                 else:
                     # Successful reply
                     observation = act_out.observations
-                    await self.write_memories(
-                        question=question,
-                        ai_message=ai_message,
-                        action_output=act_out,
-                        check_pass=check_pass,
-                        current_retry_counter=current_retry_counter,
-                    )
+                    try:
+                        await self.write_memories(
+                            question=question,
+                            ai_message=ai_message,
+                            action_output=act_out,
+                            check_pass=check_pass,
+                            current_retry_counter=current_retry_counter,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Agent {self.name} write memories failed, "
+                            f"skip memory of this round: {e}"
+                        )
                     if self.run_mode != AgentRunMode.LOOP or act_out.terminate:
                         logger.debug(f"Agent {self.name} reply success!{reply_message}")
                         break
