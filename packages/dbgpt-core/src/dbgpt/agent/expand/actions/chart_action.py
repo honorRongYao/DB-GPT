@@ -13,6 +13,13 @@ from ...resource.database import DBResource
 
 logger = logging.getLogger(__name__)
 
+# 单次查询结果下发前端的最大行数。
+# data 会被原样放进 action_report（随 SSE 事件与 gpts_message 落库整包下发）和
+# vis 渲染视图，遇到"列出多行明细"的问题（如"最近卖得火的咖啡机有哪些"）可能一次
+# 返回几千行，把前端表格渲染拖垮。这里统一只下发前 N 行，真实总行数仍保留在
+# count 字段里，供校验与结论区分"总行数"与"展示行数"。
+_MAX_RESULT_ROWS = 200
+
 
 class SqlInput(BaseModel):
     """SQL input model."""
@@ -94,8 +101,11 @@ class ChartAction(Action[SqlInput]):
 
             db = db_resources[0]
             data_df = await db.query_to_df(param.sql)
+            # 只把前 _MAX_RESULT_ROWS 行带进 view 与 action_report：
+            # count 仍是真实总行数，data 是截断后的展示样本。
+            display_df = data_df.head(_MAX_RESULT_ROWS)
             view = await self.render_protocol.display(
-                chart=json.loads(model_to_json(param)), data_df=data_df
+                chart=json.loads(model_to_json(param)), data_df=display_df
             )
 
             param_dict = model_to_dict(param)
@@ -103,7 +113,7 @@ class ChartAction(Action[SqlInput]):
                 param_dict["count"] = len(data_df)
 
                 param_dict["data"] = json.loads(
-                    data_df.to_json(
+                    display_df.to_json(
                         orient="records",
                         force_ascii=False,
                         date_format="iso",
