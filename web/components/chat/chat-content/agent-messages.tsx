@@ -11,6 +11,8 @@ interface Props {
     model: string | null;
     markdown: string;
     resource: any;
+    // 后端已按国内时间（UTC+8）格式化好的字符串，可能为空
+    created_at?: string | null;
   }[];
 }
 
@@ -27,6 +29,7 @@ function AgentMessages({ data }: Props) {
               <SwapRightOutlined className='mx-2 text-base' />
               {item.receiver}
             </div>
+            {item.created_at && <div className='ml-auto text-xs opacity-50'>{item.created_at}</div>}
           </div>
           <div className='whitespace-normal text-sm mb-3'>
             <GPTVis components={markdownComponents} {...markdownPlugins}>

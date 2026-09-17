@@ -766,7 +766,10 @@ async def flow_stream_generator(func, incremental: bool, model_name: str):
                     delta=DeltaMessage(role="assistant", content=incremental_output),
                 )
                 chunk = ChatCompletionStreamResponse(
-                    id=stream_id, choices=[choice_data], model=model_name
+                    id=stream_id,
+                    created=int(time.time()),
+                    choices=[choice_data],
+                    model=model_name,
                 )
                 _content = json.dumps(
                     chunk.dict(exclude_unset=True), ensure_ascii=False
@@ -842,7 +845,10 @@ async def stream_generator(
                         ),
                     )
                     chunk = ChatCompletionStreamResponse(
-                        id=stream_id, choices=[choice_data], model=model_name
+                        id=stream_id,
+                        created=int(time.time()),
+                        choices=[choice_data],
+                        model=model_name,
                     )
                     _content = json.dumps(
                         chunk.dict(exclude_unset=True), ensure_ascii=False

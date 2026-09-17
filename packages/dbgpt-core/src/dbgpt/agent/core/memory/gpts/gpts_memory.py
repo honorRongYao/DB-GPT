@@ -6,6 +6,7 @@ import logging
 from asyncio import Queue
 from collections import defaultdict
 from concurrent.futures import Executor, ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Union
 
 from dbgpt.util.executor_utils import blocking_func_to_async
@@ -22,6 +23,19 @@ NONE_GOAL_PREFIX: str = "none_goal_count_"
 SEMANTIC_LAYER_GOAL: str = "[语义层]:正在查询语义层资料完成检索"
 
 logger = logging.getLogger(__name__)
+
+# gpts_messages.created_at 落库用的是 datetime.utcnow（UTC，实测库里存的是 UTC 值），
+# 而界面展示要用国内时间，这里统一转成 UTC+8 后再输出。
+_CN_TIMEZONE = timezone(timedelta(hours=8))
+
+
+def _to_cn_time_str(dt: Optional[datetime]) -> Optional[str]:
+    """把库里的 UTC 时间转成国内时间字符串（YYYY-MM-DD HH:MM:SS）。"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_CN_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
 
 class GptsMemory:
@@ -255,6 +269,10 @@ class GptsMemory:
                             "status": "complete",
                             "agent": value[0].receiver if value else "",
                             "markdown": await self._messages_to_agents_vis(value),
+                            # 该步骤完成时间：取本组最后一条消息的落库时间
+                            "created_at": (
+                                _to_cn_time_str(value[-1].created_at) if value else None
+                            ),
                         }
                     )
                     need_show_singe_last_message = True
@@ -343,6 +361,10 @@ class GptsMemory:
                     "status": "complete",
                     "agent": value[0].receiver if value else "",
                     "markdown": await self._messages_to_agents_vis(value),
+                    # 该步骤完成时间：取本组最后一条消息的落库时间
+                    "created_at": (
+                        _to_cn_time_str(value[-1].created_at) if value else None
+                    ),
                 }
             )
 
@@ -479,8 +501,11 @@ class GptsMemory:
         """
         plan_lines: List[str] = []
         other_messages: List[GptsMessage] = []
+        semantic_last_message: Optional[GptsMessage] = None
         for key, value in temp_group.items():
             if key == SEMANTIC_LAYER_GOAL:
+                if value:
+                    semantic_last_message = value[-1]
                 for m in value:
                     content = (m.content or "").strip()
                     for line in content.splitlines():
@@ -513,6 +538,12 @@ class GptsMemory:
             "markdown": "<br/>".join(
                 f"\u00a0{idx}. {line}"
                 for idx, line in enumerate(plan_lines, start=1)
+            ),
+            # 该步骤完成时间：取语义层这一组最后一条消息的落库时间
+            "created_at": (
+                _to_cn_time_str(semantic_last_message.created_at)
+                if semantic_last_message
+                else None
             ),
         }
         if vis_items:
@@ -582,6 +613,7 @@ class GptsMemory:
                     "resource": (
                         message.resource_info if message.resource_info else None
                     ),
+                    "created_at": _to_cn_time_str(message.created_at),
                 }
             )
         return await vis_client.get(VisAgentMessages.vis_tag()).display(

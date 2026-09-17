@@ -14,11 +14,15 @@
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Any, List, Optional, Tuple
 
 from dbgpt.agent import AgentGenerateContext
 from dbgpt.agent.core.memory.gpts.base import GptsMessage
-from dbgpt.agent.core.memory.gpts.gpts_memory import SEMANTIC_LAYER_GOAL
+from dbgpt.agent.core.memory.gpts.gpts_memory import (
+    SEMANTIC_LAYER_GOAL,
+    _to_cn_time_str,
+)
 from dbgpt.agent.resource.database import DBResource
 from dbgpt.core import (
     LLMClient,
@@ -1632,12 +1636,17 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                 parts.append(f"\u00a0{message}…")
             # 整行状态：中途阶段仍视为进行中，只有最后一步（commit）才翻成 complete
             status = "running" if (running or not commit) else "complete"
+            # 与 gpts_messages.created_at 同口径用 UTC，输出时再转国内时间。
+            # 每次推送刷新一次，因此 running 帧是“最近一次进度时间”，
+            # 收尾那一帧即该步骤完成时间，与后续整帧重建（取组内最后一条消息时间）保持一致。
+            now_utc = datetime.utcnow()
             item = {
                 "name": SEMANTIC_LAYER_GOAL,
                 "num": 1,
                 "status": status,
                 "agent": "语义层",
                 "markdown": "<br/>".join(parts),
+                "created_at": _to_cn_time_str(now_utc),
             }
             frame_text = "```agent-plans\n" + json.dumps(
                 [item], ensure_ascii=False
@@ -1661,6 +1670,8 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
                             role=ModelMessageRoleType.AI,
                             content="\n".join(lines),
                             current_goal=SEMANTIC_LAYER_GOAL,
+                            # 显式带上收尾时间，保证整帧重建时该行时间与收尾帧一致
+                            created_at=now_utc,
                         )
                     )
                 except Exception as e:

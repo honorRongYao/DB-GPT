@@ -1,6 +1,7 @@
 """The utility functions for chatting with the DAG task."""
 
 import json
+import time
 import traceback
 from typing import Any, AsyncIterator, Dict, Optional
 
@@ -404,6 +405,8 @@ def _v1_create_completion_response(
     )
     _content = ChatCompletionResponse(
         id=stream_id,
+        # 显式赋值，否则被下游 exclude_unset=True 序列化时丢弃
+        created=int(time.time()),
         choices=[choice_data],
         model=model_name,
         usage=usage or UsageInfo(),

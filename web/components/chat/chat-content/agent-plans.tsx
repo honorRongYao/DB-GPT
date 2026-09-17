@@ -11,6 +11,8 @@ interface Props {
     status: 'complete' | 'todo';
     agent: string;
     markdown: string;
+    // 后端已按国内时间（UTC+8）格式化好的字符串，可能为空
+    created_at?: string | null;
   }[];
 }
 
@@ -34,6 +36,9 @@ function AgentPlans({ data }: Props) {
                 <CheckOutlined className='!text-green-500 ml-2' />
               ) : (
                 <ClockCircleOutlined className='!text-gray-500 ml-2' />
+              )}
+              {item.created_at && (
+                <span className='ml-2 text-xs opacity-50'>{item.created_at}</span>
               )}
             </div>
           ),
