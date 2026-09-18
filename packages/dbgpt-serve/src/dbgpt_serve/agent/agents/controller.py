@@ -3,7 +3,7 @@ import json
 import logging
 import time
 from abc import ABC
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Set, Type
 
 from fastapi import APIRouter
 
@@ -80,6 +80,19 @@ def _build_conversation(
         conv_storage=conv_serve.conv_storage,
         message_storage=conv_serve.message_storage,
     )
+
+
+# 客户端断连后仍需在后台跑完的 agent 任务强引用集合。
+# asyncio 只对 task 持弱引用，若不显式持有，任务可能在断连后的空闲期被 GC 回收。
+_background_agent_tasks: Set[asyncio.Task] = set()
+
+
+def _retain_background_task(task: Optional[asyncio.Task]) -> None:
+    """持有后台任务强引用，任务结束后自动释放。"""
+    if task is None or task.done():
+        return
+    _background_agent_tasks.add(task)
+    task.add_done_callback(_background_agent_tasks.discard)
 
 
 class MultiAgents(BaseComponent, ABC):
@@ -335,6 +348,9 @@ class MultiAgents(BaseComponent, ABC):
                     **ext_info,
                 )
             )
+            # 持有强引用：客户端首个 chunk 产出前断连时，app_agent_chat 拿不到该任务，
+            # 不能依赖它来保住引用，任务必须自己活到跑完（消息落 gpts_messages）。
+            _retain_background_task(task)
             if enable_verbose:
                 async for chunk in multi_agents.chat_messages(agent_conv_id):
                     if chunk:
@@ -544,6 +560,7 @@ class MultiAgents(BaseComponent, ABC):
             agent_conv_id = None
             agent_task = None
             default_final_message = None
+            stream_finished = False
             try:
                 async for task, chunk, agent_conv_id in multi_agents.agent_chat_v2(
                     conv_uid,
@@ -559,33 +576,82 @@ class MultiAgents(BaseComponent, ABC):
                     agent_task = task
                     default_final_message = chunk
                     yield chunk
+                stream_finished = True
 
             except asyncio.CancelledError:
                 # Client disconnects
-                print("Client disconnected")
-                if agent_task:
-                    logger.info(f"Chat to App {gpts_name}:{agent_conv_id} Cancel!")
-                    agent_task.cancel()
+                # 客户端断连不再取消 agent 任务：语义层/取数流程继续在后台跑完，
+                # 消息照常写入 gpts_messages，最终结果由后台协程补写进会话记录。
+                logger.warning(
+                    f"Client disconnected, agent task keeps running: "
+                    f"{gpts_name}:{agent_conv_id}"
+                )
             except Exception as e:
                 logger.exception(f"Chat to App {gpts_name} Failed!" + str(e))
                 raise
             finally:
-                logger.info(f"save agent chat info！{conv_uid}")
-                if agent_task:
-                    final_message = await self.stable_message(agent_conv_id)
-                    if final_message:
-                        current_message.add_view_message(final_message)
+                if stream_finished:
+                    logger.info(f"save agent chat info！{conv_uid}")
+                    if agent_task:
+                        final_message = await self.stable_message(agent_conv_id)
+                        if final_message:
+                            current_message.add_view_message(final_message)
+                    else:
+                        # 客户端在 agent 首条 chunk 产出前断开时 default_final_message
+                        # 仍为 None（语义层耗时长时常见），需要判空避免崩溃
+                        if default_final_message:
+                            default_final_message = default_final_message.replace(
+                                "data:", ""
+                            )
+                            current_message.add_view_message(default_final_message)
                 else:
-                    # 客户端在 agent 首条 chunk 产出前断开时 default_final_message
-                    # 仍为 None（语义层耗时长时常见），需要判空避免崩溃
-                    if default_final_message:
-                        default_final_message = default_final_message.replace(
-                            "data:", ""
+                    # 流未正常结束（客户端断连 / 生成器被关闭）：先把本轮用户问题存下，
+                    # agent 任务结束后的最终结果由后台协程补写
+                    # （见 _save_final_message_after_disconnect）。这里不能 await：
+                    # 生成器被 GeneratorExit 关闭时 await 会抛 RuntimeError。
+                    _retain_background_task(agent_task)
+                    if agent_task and agent_conv_id:
+                        _retain_background_task(
+                            asyncio.create_task(
+                                self._save_final_message_after_disconnect(
+                                    agent_task, current_message, agent_conv_id
+                                )
+                            )
                         )
-                        current_message.add_view_message(default_final_message)
 
                 current_message.end_current_round()
                 current_message.save_to_storage()
+
+    async def _save_final_message_after_disconnect(
+        self,
+        agent_task: asyncio.Task,
+        current_message: StorageConversation,
+        agent_conv_id: str,
+    ) -> None:
+        """客户端断连后，等后台 agent 任务跑完再补写本轮最终结果。
+
+        正常路径由 app_agent_chat 的 finally 落库；断连时 finally 跑在任务完成之前，
+        此刻会话状态还是 RUNNING，stable_message 取不到最终消息，只能先存下用户问题。
+        这里在后台任务结束后重新取一次最终消息补写，保证会话记录不丢 AI 回复
+        （gpts_messages 由后台任务自身写入，不依赖这里）。
+        """
+        try:
+            await agent_task
+        except asyncio.CancelledError:
+            logger.warning(f"Background agent task cancelled: {agent_conv_id}")
+        except Exception as e:
+            logger.error(f"Background agent task failed after disconnect: {e}")
+        try:
+            final_message = await self.stable_message(agent_conv_id)
+            if final_message:
+                current_message.add_view_message(final_message)
+            current_message.end_current_round()
+            current_message.save_to_storage()
+            logger.info(f"Save final message after client disconnected: {agent_conv_id}")
+        except Exception as e:
+            logger.exception(
+                f"Save final message after disconnect failed: {agent_conv_id}, {e}"
+            )
 
     async def agent_team_chat_new(
         self,
