@@ -482,6 +482,12 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         """列出全部可用表（表名 + 表注释，注释承载业务语义与关联关系，全量无截断）。
         内部/配置表（table_semantic、category_embedding）在目录源头排除，不再参与选表。"""
         connector = self._datasource.connector
+        # 连接器实例被 ConnectorManager 缓存（TTL 30 分钟），表名是实例构造时的快照，
+        # get_table_names() 只读快照不回查库；建表后缓存过期前新表永远进不了目录，
+        # 故选表前强制重新同步一次表名（成本一次 information_schema 查询）。
+        sync_tables = getattr(connector, "_sync_tables_from_db", None)
+        if sync_tables is not None:
+            await self.blocking_func_to_async(sync_tables)
         table_names = await self.blocking_func_to_async(connector.get_table_names)
         table_names = list(table_names)
         catalog = []
