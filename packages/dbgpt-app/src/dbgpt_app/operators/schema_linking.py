@@ -60,7 +60,7 @@ MAX_EXTRACT_KEYWORDS = 5
 # 语义层内部/配置表：不参与业务选表，永不进入目录与候选表。
 # table_semantic 存各表语义规范，仅由 _load_table_semantics 读取注入细节；
 # category_embedding(TARGET_TABLE) 是向量召回内部表。二者均非业务数据表。
-_INTERNAL_SKIP_TABLES = {TARGET_TABLE, "table_semantic_test"}
+_INTERNAL_SKIP_TABLES = {TARGET_TABLE, "table_semantic"}
 
 # 提示词模板统一约定：模板里字面 JSON 花括号一律双写（{{ }}），并在交给
 # _llm_complete 前一律经过 .format()（没有占位符也要调用）。这样后续给任一模板
@@ -1399,7 +1399,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         try:
             rows = await self.blocking_func_to_async(
                 connector.run,
-                "SELECT `table`, `semantic` FROM table_semantic_test",
+                "SELECT `table`, `semantic` FROM table_semantic",
             )
         except Exception as e:
             logger.warning(f"Load table_semantic failed: {e}")
