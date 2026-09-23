@@ -4,8 +4,9 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from dbgpt.core import (
     ModelMessage,
@@ -51,6 +52,32 @@ _SUMMARY_SKILL_RELATIVE_PATH = os.path.join("user", "result-summary", "SKILL.md"
 # 避免业务把"SQL 跑挂了"误读成"结果仅供参考"。
 _WARN_UNVERIFIED = "以下结果未经校验通过，可能不满足问题要求，仅供参考。"
 _WARN_SQL_FAILED = "本次 SQL 执行失败，没有取到数据，请调整问题或稍后重试。"
+
+# ReAct 校验失败的分类：只用于诊断打点（grep "ReAct retry stats" 看汇总），
+# 用来判断"10 轮仍答不对"到底卡在哪一类，而不是靠猜。
+_FAIL_SQL_EXEC = "sql_exec_failed"  # SQL 执行报错
+_FAIL_EMPTY = "empty_result"  # 执行成功但 0 行，且诊断判定 SQL 写错
+_FAIL_SEMANTIC = "semantic_rejected"  # 结果非空但语义校验不通过
+_FAIL_FORMAT = "bad_format"  # 回复不是合法 JSON / 缺 sql 等格式问题
+_FAIL_EXCEPTION = "check_exception"  # 校验过程抛异常
+
+# 兜底提示里回显"未通过原因"的长度上限，避免把审核的长篇说明整段塞给用户。
+_WARN_REASON_MAX_LEN = 200
+
+
+@dataclass
+class _RetryRecord:
+    """一次校验失败的记录：诊断统计用，也用于兜底时挑"最像答案"的一轮。"""
+
+    round_no: int
+    category: str
+    sql: Optional[str]
+    reason: str
+    is_exe_success: bool
+    row_count: int
+    action_out: Optional[ActionOutput]
+    action_reply_obj: Optional[dict]
+
 
 # SQL 执行失败后统一做一次诊断：先裁掉异常串里的噪声，再让大模型判断"为什么报错"，
 # 把诊断结论（而非原始异常）作为重试反馈回喂给 Agent。
@@ -150,6 +177,21 @@ class DataScientistAgent(ConversableAgent):
         self._init_actions([ChartAction])
         # 当前重试轮次（0 基），由 _load_thinking_messages 每轮刷新
         self._current_retry: int = 0
+        # 本轮提问里每次校验失败的记录，供诊断打点与兜底挑候选
+        self._retry_records: List[_RetryRecord] = []
+        # 上游语义层经 received_message.context["resource_prompt"] 注入的参考信息
+        # （允许表 + 完整表结构 + 召回来源 SQL + 用户问题），用于覆盖数据源自带的表结构
+        self._resource_prompt_override: Optional[str] = None
+
+    async def load_resource(self, question: str, is_retry_chat: bool = False):
+        """优先使用上游语义层注入的参考信息，没有再回落到数据源自带的表结构。
+
+        Agent 绑定的 DBResource 只会返回全库原始 DDL（可能过期、且与本问题无关），
+        语义层注入的才是精选表结构 + 业务规则，两者同时出现会互相打架。
+        """
+        if self._resource_prompt_override:
+            return self._resource_prompt_override, None
+        return await super().load_resource(question, is_retry_chat)
 
     async def read_memories(self, question: str) -> str:
         """Do not load long-term memories for SQL generation."""
@@ -158,8 +200,17 @@ class DataScientistAgent(ConversableAgent):
     async def _load_thinking_messages(
         self, *args, **kwargs
     ) -> Tuple[List[AgentMessage], Optional[Any]]:
-        """记录当前重试轮次（0 基），供校验失败时判断是否已是最后一轮。"""
+        """记录当前重试轮次（0 基），供校验失败时判断是否已是最后一轮。
+
+        失败记录只能在这里、且只在第 0 轮清空：_init_reply_message 在每次重试时
+        都会被调用（base_agent.generate_reply 的 current_retry_counter>0 分支），
+        若把清空放在那里，每轮都会把前面的记录丢掉，汇总统计永远只有 1 条、
+        distinct_sql 恒为 1，兜底也只能挑到最后一轮。
+        """
         self._current_retry = kwargs.get("current_retry_counter") or 0
+        if self._current_retry == 0:
+            # 新一轮提问（该 Agent 实例会被复用），清掉上一轮的失败记录
+            self._retry_records = []
         return await super()._load_thinking_messages(*args, **kwargs)
 
     def _is_last_round(self) -> bool:
@@ -181,10 +232,29 @@ class DataScientistAgent(ConversableAgent):
 
         warn: 面向用户的提示文案；不传时用通用的"未经校验"说明。
         区分文案是为了让业务能分清"SQL 执行失败"与"结果不合规"两种情况。
+
+        结果数据不再默认取最后一轮：最后一轮往往已被前面几轮（可能是错的）失败
+        反馈带偏，这里回退到"最像答案"的一轮——优先执行成功且行数非空，其次执行
+        成功，都没有才用最后一轮。用户提示里同时标明取自第几轮、以及未通过的原因。
         """
-        # 面向用户只给简短提示：不拼接审核返回的技术性理由（含"修改方法"等
-        # 给 Agent 的重试指令），完整原因仅记日志，便于排查。
-        warn = warn or _WARN_UNVERIFIED
+        best = self._select_best_candidate()
+        if best is not None and best.action_out is not None and action_out is not None:
+            # 用候选轮的数据覆盖本轮 action_out 的内容，而不是换引用：调用方
+            # （message.action_report）持有的是本轮这个对象，换引用前端拿不到替换结果。
+            sql = best.sql or sql
+            action_reply_obj = best.action_reply_obj
+            reason = best.reason
+            action_out.is_exe_success = best.action_out.is_exe_success
+            # 这条候选是执行成功的那条，不适用"SQL 执行失败"文案
+            warn = None
+            round_no = best.round_no
+        else:
+            round_no = self._current_retry + 1
+        detail = self._shorten_reason(reason)
+        warn = (
+            f"{warn or _WARN_UNVERIFIED}（取自第 {round_no} 轮尝试"
+            f"{'，未通过原因：' + detail if detail else ''}）"
+        )
         if action_out is not None:
             try:
                 obj = action_reply_obj if isinstance(action_reply_obj, dict) else {}
@@ -206,7 +276,10 @@ class DataScientistAgent(ConversableAgent):
                 )
             except Exception as e:
                 logger.warning(f"Finalize unverified result failed, skip: {e}")
-        logger.info(f"Last round not pass, finalize with reason: {reason}")
+        logger.info(
+            f"Last round not pass, finalize with round {round_no} result, "
+            f"reason: {reason}"
+        )
         return True, None
 
     async def _check_fail(
@@ -216,9 +289,22 @@ class DataScientistAgent(ConversableAgent):
         action_out: Optional[ActionOutput] = None,
         action_reply_obj: Optional[dict] = None,
         warn: Optional[str] = None,
+        category: str = _FAIL_FORMAT,
     ) -> Tuple[bool, Optional[str]]:
-        """校验失败的统一出口：非最后一轮返回失败触发重试，最后一轮兜底收口。"""
+        """校验失败的统一出口：非最后一轮返回失败触发重试，最后一轮兜底收口。
+
+        category 只服务诊断打点：把每次失败归类记下来，最后一轮输出汇总，用来判断
+        "10 轮仍答不对"主要卡在 SQL 报错、结果为空还是语义校验，而不是靠猜。
+        """
+        self._record_retry_failure(
+            category,
+            reason,
+            sql=sql,
+            action_out=action_out,
+            action_reply_obj=action_reply_obj,
+        )
         if self._is_last_round():
+            self._log_retry_stats()
             return await self._finalize_unverified(
                 reason,
                 sql=sql,
@@ -226,19 +312,114 @@ class DataScientistAgent(ConversableAgent):
                 action_reply_obj=action_reply_obj,
                 warn=warn,
             )
+        # 返回的重试反馈会在下一轮拼成 [2] HUMAN 的内容。base_agent 已用
+        # "【校验失败原因与改造建议】" 作标题，所以原因放在最前、SQL 补在后面，
+        # 否则标题下方先出现 SQL 段，读起来像个空标题。
+        # 补 SQL 的原因：重试时模型只有系统提示词、原始问题和这段反馈，拿不到自己
+        # 上一轮写过的 SQL（read_memories 返回空串，历史消息也不会重建），不给 SQL
+        # 就无从"修正"，只能每轮从零重写。
+        if sql:
+            return (
+                False,
+                f"{reason}\n\n【上一轮提交的 SQL（已执行，未通过校验）】\n{sql}",
+            )
         return False, reason
+
+    def _record_retry_failure(
+        self,
+        category: str,
+        reason: Optional[str],
+        sql: Optional[str] = None,
+        action_out: Optional[ActionOutput] = None,
+        action_reply_obj: Optional[dict] = None,
+    ) -> None:
+        """记下一次校验失败，并打一行分轮日志（含已出现的不重复 SQL 条数）。"""
+        row_count = 0
+        if isinstance(action_reply_obj, dict):
+            _, values = self._extract_result_rows(action_reply_obj)
+            row_count = len(values)
+        record = _RetryRecord(
+            round_no=self._current_retry + 1,
+            category=category,
+            sql=sql,
+            reason=reason or "",
+            is_exe_success=bool(action_out is not None and action_out.is_exe_success),
+            row_count=row_count,
+            action_out=action_out,
+            action_reply_obj=action_reply_obj,
+        )
+        self._retry_records.append(record)
+        logger.info(
+            f"ReAct round {record.round_no} failed: category={category}, "
+            f"exe_success={record.is_exe_success}, rows={row_count}, "
+            f"distinct_sql={self._distinct_sql_count()}"
+        )
+
+    def _log_retry_stats(self) -> None:
+        """汇总本次 ReAct 的失败构成，定位"10 轮仍答不对"的根因。"""
+        counters: Dict[str, int] = {}
+        for record in self._retry_records:
+            counters[record.category] = counters.get(record.category, 0) + 1
+        best = self._select_best_candidate()
+        logger.info(
+            "ReAct retry stats: rounds=%s, %s, distinct_sql=%s, best_candidate=%s",
+            self._current_retry + 1,
+            ", ".join(f"{key}={value}" for key, value in sorted(counters.items())),
+            self._distinct_sql_count(),
+            f"round{best.round_no}(rows={best.row_count})" if best else "none",
+        )
+
+    def _select_best_candidate(self) -> Optional[_RetryRecord]:
+        """挑一条最像正确答案的失败记录：执行成功且行数非空优先，同档取最晚一轮。"""
+        with_data = [
+            record
+            for record in self._retry_records
+            if record.is_exe_success and record.row_count > 0
+        ]
+        if with_data:
+            return with_data[-1]
+        executed = [record for record in self._retry_records if record.is_exe_success]
+        return executed[-1] if executed else None
+
+    def _distinct_sql_count(self) -> int:
+        """已尝试过的不同 SQL 条数：数值接近轮数说明模型没有重复自己。"""
+        return len({record.sql for record in self._retry_records if record.sql})
+
+    @staticmethod
+    def _shorten_reason(reason: Optional[str]) -> str:
+        """把"未通过原因"压成一行并限长，供用户提示使用。"""
+        return " ".join((reason or "").split())[:_WARN_REASON_MAX_LEN]
 
     def _init_reply_message(
         self,
         received_message: AgentMessage,
         rely_messages: Optional[List[AgentMessage]] = None,
     ) -> AgentMessage:
-        # 保存用户问题，供 correctness_check 做 LLM 语义校验时使用
-        self._current_question = received_message.content or ""
+        # 上游语义层把「参考信息」正文（允许表 + 表结构 + 召回 SQL + 用户问题）放在
+        # 消息 context 里，message.content 只留用户问题。这里取出来：
+        # - 它同时作为系统提示词的 {resource_prompt}（见 load_resource 覆盖）；
+        # - 也用来拼 _current_question，因为这段文本带着"用户问题:"标记，
+        #   _split_question_and_schema 才能拆出表结构，供 correctness_check
+        #   等 LLM 校验使用；若只用 content（纯问题）则会丢掉表结构上下文。
+        received_context = received_message.get_dict_context()
+        override = received_context.get("resource_prompt")
+        self._resource_prompt_override = override if isinstance(override, str) else None
+        self._current_question = (
+            self._resource_prompt_override or received_message.content or ""
+        )
         reply_message = super()._init_reply_message(received_message, rely_messages)
+        # 提示词里的 {dialect} 取这里。不能直接用连接层的 dialect：Doris、StarRocks
+        # 这类库走 MySQL 协议，引擎方言名只会是 "mysql"，但它们的语法约束与 MySQL
+        # 并不等同（例如 Doris 的 WHERE 中不允许出现聚合函数），提示词里写 "mysql"
+        # 会诱导模型按 MySQL 习惯生成 SQL，在真实库上报错。所以优先报资源上真实的
+        # 库类型 db_type，取不到时才退回 dialect。
+        try:
+            prompt_dialect = self.database.db_type or self.database.dialect
+        except ValueError:
+            prompt_dialect = self.database.dialect
         reply_message.context = {
             "display_type": self.actions[0].render_prompt(),
-            "dialect": self.database.dialect,
+            "dialect": prompt_dialect,
         }
         # AgentMessage.success 默认 True，会让"重试纠错反馈（retry_message）"和
         # "未通过校验的中间回复"在写入 gpts_messages 时 is_success=1，与真实校验结果不符。
@@ -308,6 +489,7 @@ class DataScientistAgent(ConversableAgent):
         if action_out is not None and not action_out.is_exe_success and review_approved:
             question = getattr(self, "_current_question", "") or ""
             error_desc = action_out.content or ""
+            sql = self._extract_sql_from_reply(message.content)
             if not question:
                 logger.warning(
                     "SQL failed but current question is empty, skip analysis"
@@ -316,14 +498,16 @@ class DataScientistAgent(ConversableAgent):
             else:
                 feedback = await self._analyze_sql_error(
                     question,
-                    self._extract_sql_from_reply(message.content),
+                    sql,
                     error_desc,
                 )
                 logger.info(f"SQL error analyzed, retry feedback: {feedback}")
             return await self._check_fail(
                 feedback,
+                sql=sql,
                 action_out=action_out,
                 warn=_WARN_SQL_FAILED,
+                category=_FAIL_SQL_EXEC,
             )
         return await super().verify(message, sender, reviewer, **kwargs)
 
@@ -353,12 +537,14 @@ class DataScientistAgent(ConversableAgent):
                 "Please check your answer, the output content is not valid JSON, "
                 "please regenerate a reply strictly in the required format.",
                 action_out=action_out,
+                category=_FAIL_FORMAT,
             )
         if not isinstance(action_reply_obj, dict):
             return await self._check_fail(
                 "Please check your answer, the output content is not a valid JSON "
                 "object, please regenerate a reply strictly in the required format.",
                 action_out=action_out,
+                category=_FAIL_FORMAT,
             )
         sql = action_reply_obj.get("sql", None)
         if not sql:
@@ -367,6 +553,7 @@ class DataScientistAgent(ConversableAgent):
                 "generated is not found.",
                 action_out=action_out,
                 action_reply_obj=action_reply_obj,
+                category=_FAIL_FORMAT,
             )
         try:
             if not action_out.resource_value:
@@ -376,6 +563,7 @@ class DataScientistAgent(ConversableAgent):
                     sql=sql,
                     action_out=action_out,
                     action_reply_obj=action_reply_obj,
+                    category=_FAIL_FORMAT,
                 )
 
             # 直接复用 ChartAction 已执行的真实结果（data 由 ChartAction 用查询结果
@@ -414,12 +602,14 @@ class DataScientistAgent(ConversableAgent):
                         sql=sql,
                         action_out=action_out,
                         action_reply_obj=action_reply_obj,
+                        category=_FAIL_EMPTY,
                     )
                 return await self._check_fail(
                     error_desc,
                     sql=sql,
                     action_out=action_out,
                     action_reply_obj=action_reply_obj,
+                    category=_FAIL_EMPTY,
                 )
             else:
                 logger.info(
@@ -441,6 +631,7 @@ class DataScientistAgent(ConversableAgent):
                             sql=sql,
                             action_out=action_out,
                             action_reply_obj=action_reply_obj,
+                            category=_FAIL_SEMANTIC,
                         )
                     await self._replace_result_summary(
                         question=question,
@@ -467,6 +658,7 @@ class DataScientistAgent(ConversableAgent):
                 sql=sql,
                 action_out=action_out,
                 action_reply_obj=action_reply_obj,
+                category=_FAIL_EXCEPTION,
             )
 
     @staticmethod
@@ -576,7 +768,12 @@ class DataScientistAgent(ConversableAgent):
             "『需进一步确认』这类没有明确问题点的理由，一律视为通过；\n"
             "5. 执行结果非空即证明所查询的对象（含时间区间、过滤值）在库中确实有数据，"
             "不得据此反向声称某月『数据尚未更新/尚未产生』；要否定某个过滤值，"
-            "必须给出该值在表结构取值参考中不存在、或结果为空的具体依据。\n"
+            "必须给出该值在表结构取值参考中不存在、或结果为空的具体依据；\n"
+            "6. 下方表结构里『使用 xxx 生成SQL需要参考下面规范』的规范是唯一业务口径。"
+            "规范已明文规定的，逐条对照规范判定；规范未规定的事项，"
+            "例如趋势用首末月对比还是环比/回归、缺失月份如何填充、"
+            "『最高/前N』按哪个时间窗口排名，一律判通过，"
+            "不得以『更严谨/更精确/更全面/更符合分析习惯』为由否定一种合理实现。\n"
             "重点检查（仅限可明确判定的硬性要求）：\n"
             "1. 问题要求 TOP3/前N/排名时，SQL 是否真正用窗口函数或 LIMIT 取了前N，"
             "若没有取前N则明确指出并给出改法；\n"

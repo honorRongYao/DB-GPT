@@ -60,7 +60,7 @@ MAX_EXTRACT_KEYWORDS = 5
 # 语义层内部/配置表：不参与业务选表，永不进入目录与候选表。
 # table_semantic 存各表语义规范，仅由 _load_table_semantics 读取注入细节；
 # category_embedding(TARGET_TABLE) 是向量召回内部表。二者均非业务数据表。
-_INTERNAL_SKIP_TABLES = {TARGET_TABLE, "table_semantic"}
+_INTERNAL_SKIP_TABLES = {TARGET_TABLE, "table_semantic_test"}
 
 # 提示词模板统一约定：模板里字面 JSON 花括号一律双写（{{ }}），并在交给
 # _llm_complete 前一律经过 .format()（没有占位符也要调用）。这样后续给任一模板
@@ -1399,7 +1399,7 @@ class HOSchemaLinkingRetrieverOperator(MixinLLMOperator, MapOperator[str, HOCont
         try:
             rows = await self.blocking_func_to_async(
                 connector.run,
-                "SELECT `table`, `semantic` FROM table_semantic",
+                "SELECT `table`, `semantic` FROM table_semantic_test",
             )
         except Exception as e:
             logger.warning(f"Load table_semantic failed: {e}")
@@ -2680,8 +2680,16 @@ class HOSchemaLinkingAgentOperator(HOSchemaLinkingRetrieverOperator):
             final_names, recall_items, kept_items
         )
 
-        # step14 组装 user 消息：允许表 + 完整表结构 + 召回来源 SQL + 用户问题
-        input_value.message.content = (
+        # step14 组装注入文本：允许表 + 完整表结构 + 召回来源 SQL + 用户问题。
+        # 这段文本不再改写 message.content，而是挂到 message.context["resource_prompt"]，
+        # message.content 保持用户问题原文不变：
+        # - Agent 侧 DataScientistAgent.load_resource 会优先取它填充系统提示词的
+        #   {resource_prompt}，表结构因此仍然只出现一次，且不会再与 Agent 数据源自带的
+        #   全库表结构（system 侧）重复并互相冲突；
+        # - user 消息里不再夹带整段表结构，只有用户问题本身。
+        if not isinstance(input_value.message.context, dict):
+            input_value.message.context = {}
+        input_value.message.context["resource_prompt"] = (
             f"允许使用的表及表间关联关系:\n{selected_text}\n\n"
             f"允许使用表的完整表结构（字段、类型、主键、注释）:\n{schemas_text}"
             f"{recall_context}\n\n"
