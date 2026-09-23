@@ -38,7 +38,7 @@ provider = "proxy/deepseek"
 # Disable V4-Pro thinking mode so ReAct responses stay parseable.
 thinking_enabled = false
 # api_key = "7kYS8-mli4vISGEBjxI3KSWF8AUEijEpy1jh6FKuEu4"
-api_key = "sk-71464781a57346a38ea94fea75bfe80f"
+api_key = "sk-16bb399c704045d2b2d71b33810a4d5d"
 
 [[models.embeddings]]
 name = "bge-m3"
