@@ -191,6 +191,8 @@ thirdparty
 /i18n/locales/**/**/*~
 configs/my
 .devcontainer/dev.toml
+# 含真实 api_key / 数据库密码，只保留在本地与服务器，不入库
+configs/llm.toml
 test_docs
 
 # AI coding assistant configs
